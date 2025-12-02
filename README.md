@@ -27,7 +27,7 @@
                           high-performance database engine
                                  built in golang
 
-                                    dec 2024
+                                    dec 2025
 
 
 
