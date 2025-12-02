@@ -1,0 +1,104 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+server
+fasty
+*.test
+*.out
+
+# Go workspace file
+go.work
+
+# Build artifacts
+/bin/
+/dist/
+/build/
+*.a
+
+# Test files
+*.test
+*.prof
+coverage.txt
+coverage.html
+
+# Database files
+/data/
+*.moss
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE - VSCode
+.vscode/
+*.code-workspace
+
+# IDE - GoLand
+.idea/
+*.iml
+
+# IDE - Vim
+*.swp
+*.swo
+*~
+.vim/
+
+# IDE - Emacs
+*~
+\#*\#
+.\#*
+
+# OS - macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.Spotlight-V100
+.Trashes
+
+# OS - Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# OS - Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Benchmark results
+benchmark_results/
+*.bench
+
+# Profiling
+*.pprof
+cpu.prof
+mem.prof
+
+# Backup files
+*.bak
+*.backup
+*~
+
