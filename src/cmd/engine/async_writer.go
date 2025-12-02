@@ -18,6 +18,7 @@ type AsyncWriter struct {
 	doneChan    chan struct{}
 	flushWg     sync.WaitGroup
 	flushTicker *time.Ticker
+	persistTicker *time.Ticker
 
 	pending   uint64
 	flushed   uint64
@@ -25,6 +26,7 @@ type AsyncWriter struct {
 
 	maxBatchSize   int
 	flushInterval  time.Duration
+	persistInterval time.Duration
 	numFlushers    int
 }
 
@@ -34,9 +36,10 @@ func NewAsyncWriter(db *RelationalDB) *AsyncWriter {
 		buffer:         make([][2][]byte, 0, 50000),
 		flushChan:      make(chan [][2][]byte, 100),
 		doneChan:       make(chan struct{}),
-		maxBatchSize:   10000, 
+		maxBatchSize:   10000,
 		flushInterval:  50 * time.Millisecond,
-		numFlushers:    4, 
+		persistInterval: 5 * time.Second,
+		numFlushers:    4,
 	}
 
 	for i := 0; i < aw.numFlushers; i++ {
@@ -46,6 +49,9 @@ func NewAsyncWriter(db *RelationalDB) *AsyncWriter {
 
 	aw.flushTicker = time.NewTicker(aw.flushInterval)
 	go aw.timerFlusher()
+
+	aw.persistTicker = time.NewTicker(aw.persistInterval)
+	go aw.persistTimer()
 
 	return aw
 }
@@ -66,6 +72,17 @@ func (aw *AsyncWriter) timerFlusher() {
 		select {
 		case <-aw.flushTicker.C:
 			aw.FlushAsync()
+		case <-aw.doneChan:
+			return
+		}
+	}
+}
+
+func (aw *AsyncWriter) persistTimer() {
+	for {
+		select {
+		case <-aw.persistTicker.C:
+			aw.db.kv.Flush()
 		case <-aw.doneChan:
 			return
 		}
@@ -154,8 +171,10 @@ func (aw *AsyncWriter) FlushSync() {
 
 func (aw *AsyncWriter) Close() {
 	aw.flushTicker.Stop()
+	aw.persistTicker.Stop()
 	close(aw.doneChan)
 	aw.FlushSync()
+	aw.db.kv.Flush()
 	close(aw.flushChan)
 	aw.flushWg.Wait()
 }

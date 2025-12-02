@@ -65,23 +65,18 @@ func main() {
 
 	setup()
 	totalStart := time.Now()
+	var totalOps uint64
 
 	fmt.Println("\n[1] Single INSERT (baseline)")
-	benchSingleInserts(5000, 100)
+	totalOps += benchSingleInserts(5000, 100)
 
-	fmt.Println("\n[2] Batch INSERT via /batch")
+	fmt.Println("\n[2] Batch INSERT via /query")
 	for _, size := range []int{100, 500, 1000, 5000} {
 		fmt.Printf("  batch size %d: ", size)
-		benchBatchInserts(50000, size, "/batch")
+		totalOps += benchBatchInserts(100000, size, "/query")
 	}
 
-	fmt.Println("\n[3] Batch INSERT via /turbo (async)")
-	for _, size := range []int{100, 500, 1000, 5000} {
-		fmt.Printf("  batch size %d: ", size)
-		benchBatchInserts(100000, size, "/turbo")
-	}
-
-	fmt.Println("\n[4] Parallel /turbo")
+	fmt.Println("\n[3] Parallel /query")
 	configs := []struct{ total, batch, workers int }{
 		{200000, 1000, 10},
 		{500000, 2000, 20},
@@ -89,46 +84,52 @@ func main() {
 	}
 	for _, c := range configs {
 		fmt.Printf("  %dk rows, %d/batch, %d workers: ", c.total/1000, c.batch, c.workers)
-		benchParallelBatch(c.total, c.batch, c.workers)
+		totalOps += benchParallelBatch(c.total, c.batch, c.workers)
 	}
 
-	fmt.Println("\n[5] Large payloads")
+	fmt.Println("\n[4] Large payloads")
 	for _, size := range []int{1024, 4096} {
 		fmt.Printf("  %d bytes/row: ", size)
-		benchLargePayloads(5000, size)
+		totalOps += benchLargePayloads(5000, size)
 	}
 
-	fmt.Println("\n[6] Mixed read/write workload")
+	fmt.Println("\n[5] Mixed read/write workload")
 	fmt.Printf("  70%% write: ")
-	benchMixedWorkload(10000, 20, 0.7)
+	totalOps += benchMixedWorkload(10000, 20, 0.7)
 	fmt.Printf("  50%% write: ")
-	benchMixedWorkload(10000, 20, 0.5)
+	totalOps += benchMixedWorkload(10000, 20, 0.5)
 	fmt.Printf("  30%% write: ")
-	benchMixedWorkload(10000, 20, 0.3)
+	totalOps += benchMixedWorkload(10000, 20, 0.3)
 
-	fmt.Println("\n[7] Query performance")
+	fmt.Println("\n[6] Query performance")
 	populateIndexedTable(50000)
 	fmt.Printf("  index lookup: ")
-	benchIndexedQueries(2000, 20)
+	totalOps += benchIndexedQueries(2000, 20)
 	fmt.Printf("  range query: ")
-	benchRangeQueries(500, 10)
+	totalOps += benchRangeQueries(500, 10)
 	fmt.Printf("  order by + limit: ")
-	benchOrderByQueries(200, 5)
+	totalOps += benchOrderByQueries(200, 5)
 
-	fmt.Println("\n[8] Sustained load (10 seconds)")
-	benchSustainedLoad(10*time.Second, 50, 500)
+	fmt.Println("\n[7] Sustained load (10 seconds)")
+	totalOps += benchSustainedLoad(10*time.Second, 50, 500)
 
-	fmt.Println("\n[9] Burst traffic (5 waves)")
-	benchBurstTraffic(5, 50000, 1000, 20)
+	fmt.Println("\n[8] Burst traffic (5 waves)")
+	totalOps += benchBurstTraffic(5, 50000, 1000, 20)
 
-	fmt.Println("\n[10] Latency distribution")
+	fmt.Println("\n[9] Latency distribution")
 	fmt.Printf("  single inserts: ")
-	benchLatencyDistribution(5000, 50)
+	totalOps += benchLatencyDistribution(5000, 50)
 	fmt.Printf("  batch inserts: ")
-	benchBatchLatency(500, 500, 20)
+	totalOps += benchBatchLatency(500, 500, 20)
+
+	totalElapsed := time.Since(totalStart)
+	totalThroughput := float64(totalOps) / totalElapsed.Seconds()
 
 	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("Total time: %v\n", time.Since(totalStart).Round(time.Second))
+	fmt.Printf("Total operations: %d\n", totalOps)
+	fmt.Printf("Total time: %v\n", totalElapsed.Round(time.Second))
+	fmt.Printf("Total throughput: %.0f ops/sec\n", totalThroughput)
+	fmt.Println(strings.Repeat("=", 60))
 }
 
 func setup() {
@@ -175,7 +176,7 @@ func batchInsert(table string, rows []map[string]interface{}, endpoint string) e
 	return client.Do(req, resp)
 }
 
-func benchSingleInserts(total, workers int) {
+func benchSingleInserts(total, workers int) uint64 {
 	var ops, errors uint64
 	start := time.Now()
 	perWorker := total / workers
@@ -201,9 +202,10 @@ func benchSingleInserts(total, workers int) {
 	wg.Wait()
 	elapsed := time.Since(start)
 	fmt.Printf("%d ops in %v (%.0f ops/sec)\n", ops, elapsed.Round(time.Millisecond), float64(ops)/elapsed.Seconds())
+	return ops
 }
 
-func benchBatchInserts(total, batchSize int, endpoint string) {
+func benchBatchInserts(total, batchSize int, endpoint string) uint64 {
 	var ops, errors uint64
 	start := time.Now()
 	numBatches := total / batchSize
@@ -226,9 +228,10 @@ func benchBatchInserts(total, batchSize int, endpoint string) {
 
 	elapsed := time.Since(start)
 	fmt.Printf("%d ops in %v (%.0f ops/sec)\n", ops, elapsed.Round(time.Millisecond), float64(ops)/elapsed.Seconds())
+	return ops
 }
 
-func benchParallelBatch(total, batchSize, workers int) {
+func benchParallelBatch(total, batchSize, workers int) uint64 {
 	var ops, errors uint64
 	start := time.Now()
 	batchesPerWorker := (total / batchSize) / workers
@@ -248,7 +251,7 @@ func benchParallelBatch(total, batchSize, workers int) {
 						"data": "parallel test", "score": float64(id) * 0.5, "active": id%2 == 0,
 					}
 				}
-				if err := batchInsert("bench_stress", rows, "/turbo"); err != nil {
+				if err := batchInsert("bench_stress", rows, "/query"); err != nil {
 					atomic.AddUint64(&errors, 1)
 				} else {
 					atomic.AddUint64(&ops, uint64(batchSize))
@@ -260,9 +263,10 @@ func benchParallelBatch(total, batchSize, workers int) {
 	wg.Wait()
 	elapsed := time.Since(start)
 	fmt.Printf("%d ops in %v (%.0f ops/sec)\n", ops, elapsed.Round(time.Millisecond), float64(ops)/elapsed.Seconds())
+	return ops
 }
 
-func benchLargePayloads(total, payloadSize int) {
+func benchLargePayloads(total, payloadSize int) uint64 {
 	var ops uint64
 	start := time.Now()
 	payload := strings.Repeat("X", payloadSize)
@@ -273,7 +277,7 @@ func benchLargePayloads(total, payloadSize int) {
 		for i := 0; i < batchSize; i++ {
 			rows[i] = map[string]interface{}{"id": b*batchSize + i, "payload": payload}
 		}
-		if err := batchInsert("bench_large", rows, "/turbo"); err == nil {
+		if err := batchInsert("bench_large", rows, "/query"); err == nil {
 			atomic.AddUint64(&ops, uint64(batchSize))
 		}
 	}
@@ -281,9 +285,10 @@ func benchLargePayloads(total, payloadSize int) {
 	elapsed := time.Since(start)
 	mbps := float64(ops) * float64(payloadSize) / elapsed.Seconds() / 1024 / 1024
 	fmt.Printf("%d ops in %v (%.0f ops/sec, %.1f MB/sec)\n", ops, elapsed.Round(time.Millisecond), float64(ops)/elapsed.Seconds(), mbps)
+	return ops
 }
 
-func benchMixedWorkload(total, workers int, writeRatio float64) {
+func benchMixedWorkload(total, workers int, writeRatio float64) uint64 {
 	var writes, reads, errors uint64
 	start := time.Now()
 	perWorker := total / workers
@@ -318,6 +323,7 @@ func benchMixedWorkload(total, workers int, writeRatio float64) {
 	elapsed := time.Since(start)
 	total64 := writes + reads
 	fmt.Printf("%d ops (%d w, %d r) in %v (%.0f ops/sec)\n", total64, writes, reads, elapsed.Round(time.Millisecond), float64(total64)/elapsed.Seconds())
+	return total64
 }
 
 func populateIndexedTable(total int) {
@@ -332,12 +338,12 @@ func populateIndexedTable(total int) {
 				"category": cats[id%len(cats)], "ts": time.Now().UnixNano(),
 			}
 		}
-		batchInsert("bench_indexed", rows, "/turbo")
+		batchInsert("bench_indexed", rows, "/query")
 	}
 	time.Sleep(300 * time.Millisecond)
 }
 
-func benchIndexedQueries(total, workers int) {
+func benchIndexedQueries(total, workers int) uint64 {
 	var ops uint64
 	start := time.Now()
 	perWorker := total / workers
@@ -359,9 +365,10 @@ func benchIndexedQueries(total, workers int) {
 	wg.Wait()
 	elapsed := time.Since(start)
 	fmt.Printf("%d queries in %v (%.0f q/sec)\n", ops, elapsed.Round(time.Millisecond), float64(ops)/elapsed.Seconds())
+	return ops
 }
 
-func benchRangeQueries(total, workers int) {
+func benchRangeQueries(total, workers int) uint64 {
 	var ops uint64
 	start := time.Now()
 	cats := []string{"electronics", "clothing", "books", "food", "toys", "sports", "home", "auto"}
@@ -384,9 +391,10 @@ func benchRangeQueries(total, workers int) {
 	wg.Wait()
 	elapsed := time.Since(start)
 	fmt.Printf("%d queries in %v (%.0f q/sec)\n", ops, elapsed.Round(time.Millisecond), float64(ops)/elapsed.Seconds())
+	return ops
 }
 
-func benchOrderByQueries(total, workers int) {
+func benchOrderByQueries(total, workers int) uint64 {
 	var ops uint64
 	start := time.Now()
 	perWorker := total / workers
@@ -407,9 +415,10 @@ func benchOrderByQueries(total, workers int) {
 	wg.Wait()
 	elapsed := time.Since(start)
 	fmt.Printf("%d queries in %v (%.0f q/sec)\n", ops, elapsed.Round(time.Millisecond), float64(ops)/elapsed.Seconds())
+	return ops
 }
 
-func benchSustainedLoad(duration time.Duration, workers, batchSize int) {
+func benchSustainedLoad(duration time.Duration, workers, batchSize int) uint64 {
 	var ops uint64
 	start := time.Now()
 	deadline := start.Add(duration)
@@ -430,7 +439,7 @@ func benchSustainedLoad(duration time.Duration, workers, batchSize int) {
 						"data": "sustained", "score": 1.0, "active": true,
 					}
 				}
-				if err := batchInsert("bench_stress", rows, "/turbo"); err == nil {
+				if err := batchInsert("bench_stress", rows, "/query"); err == nil {
 					atomic.AddUint64(&ops, uint64(batchSize))
 				}
 				batch++
@@ -441,9 +450,10 @@ func benchSustainedLoad(duration time.Duration, workers, batchSize int) {
 	wg.Wait()
 	elapsed := time.Since(start)
 	fmt.Printf("%d ops in %v (%.0f ops/sec avg)\n", ops, elapsed.Round(time.Millisecond), float64(ops)/elapsed.Seconds())
+	return ops
 }
 
-func benchBurstTraffic(waves, opsPerWave, batchSize, workers int) {
+func benchBurstTraffic(waves, opsPerWave, batchSize, workers int) uint64 {
 	var totalOps uint64
 	start := time.Now()
 
@@ -467,7 +477,7 @@ func benchBurstTraffic(waves, opsPerWave, batchSize, workers int) {
 							"data": "burst", "score": 1.0, "active": true,
 						}
 					}
-					if err := batchInsert("bench_stress", rows, "/turbo"); err == nil {
+					if err := batchInsert("bench_stress", rows, "/query"); err == nil {
 						atomic.AddUint64(&ops, uint64(batchSize))
 					}
 				}
@@ -483,11 +493,11 @@ func benchBurstTraffic(waves, opsPerWave, batchSize, workers int) {
 
 	elapsed := time.Since(start)
 	fmt.Printf("  total: %d ops in %v (%.0f ops/sec avg)\n", totalOps, elapsed.Round(time.Millisecond), float64(totalOps)/elapsed.Seconds())
+	return totalOps
 }
 
-func benchLatencyDistribution(total, workers int) {
+func benchLatencyDistribution(total, workers int) uint64 {
 	stats := &BenchStats{latencies: make([]time.Duration, 0, total)}
-	start := time.Now()
 	perWorker := total / workers
 
 	var wg sync.WaitGroup
@@ -497,7 +507,7 @@ func benchLatencyDistribution(total, workers int) {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
 				id := wid*perWorker + i + 50000000
-				q := fmt.Sprintf(`insert bench_stress { id: %d, name: "l%d", value: %d, data: "lat", score: 1.0, active: true }`, id, id, id)
+				q := fmt.Sprintf(`insert bench_stress { id: %d, name: "l%d", value: %d, data: "lat", score: true }`, id, id, id)
 				opStart := time.Now()
 				if _, err := query(q); err == nil {
 					atomic.AddUint64(&stats.ops, 1)
@@ -508,15 +518,13 @@ func benchLatencyDistribution(total, workers int) {
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start)
 	p50, p95, p99 := stats.Percentiles()
 	fmt.Printf("%d ops, p50=%v p95=%v p99=%v\n", stats.ops, p50.Round(time.Microsecond), p95.Round(time.Microsecond), p99.Round(time.Microsecond))
-	_ = elapsed
+	return stats.ops
 }
 
-func benchBatchLatency(numBatches, batchSize, workers int) {
+func benchBatchLatency(numBatches, batchSize, workers int) uint64 {
 	stats := &BenchStats{latencies: make([]time.Duration, 0, numBatches)}
-	start := time.Now()
 	perWorker := numBatches / workers
 
 	var wg sync.WaitGroup
@@ -535,7 +543,7 @@ func benchBatchLatency(numBatches, batchSize, workers int) {
 					}
 				}
 				opStart := time.Now()
-				if err := batchInsert("bench_stress", rows, "/turbo"); err == nil {
+				if err := batchInsert("bench_stress", rows, "/query"); err == nil {
 					atomic.AddUint64(&stats.ops, uint64(batchSize))
 					stats.AddLatency(time.Since(opStart))
 				}
@@ -544,8 +552,7 @@ func benchBatchLatency(numBatches, batchSize, workers int) {
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start)
 	p50, p95, p99 := stats.Percentiles()
 	fmt.Printf("%d ops, p50=%v p95=%v p99=%v\n", stats.ops, p50.Round(time.Microsecond), p95.Round(time.Microsecond), p99.Round(time.Microsecond))
-	_ = elapsed
+	return stats.ops
 }
