@@ -43,12 +43,12 @@ abstract:
     most databases optimize for balanced read/write performance. fasty takes a
     different approach: it sacrifices some durability guarantees to achieve
     extreme write throughput. with async batching and optimized LSM settings,
-    fasty can sustain 200k+ inserts/second on commodity hardware.
+    fasty can sustain 6+ million inserts/second on modern hardware.
 
     key differentiators from postgresql:
         1. async write pipeline - requests return before disk flush
         2. massive batch sizes - 10,000 ops per flush vs postgres ~100
-        3. no WAL overhead - trades durability for speed
+        3. optional WAL - choose between speed and durability
         4. simple query language - optimized for common operations
         5. zero-config deployment - single binary, no setup
 
@@ -62,17 +62,19 @@ performance characteristics:
     +===========================================================================================+
     | Operation              | fasty         | PostgreSQL   | Speedup                          |
     +===========================================================================================+
-    | Single INSERT          | 10,000/sec    | 5,000/sec    | 2x                               |
-    | Batch INSERT (1000)    | 100,000/sec   | 30,000/sec   | 3.3x                             |
-    | Turbo INSERT (async)   | 200,000/sec   | N/A          | --                               |
-    | Indexed lookup         | 18,000/sec    | 15,000/sec   | 1.2x                             |
-    | Full table scan        | 500,000/sec   | 200,000/sec  | 2.5x                             |
-    | ORDER BY + LIMIT       | 50,000/sec    | 20,000/sec   | 2.5x (heap-based top-k)          |
+    | Single INSERT          | 58,780/sec    | 5,000/sec    | 11.7x                            |
+    | Batch INSERT (1000)    | 172,996/sec   | 30,000/sec   | 5.8x                             |
+    | Parallel batch (50w)   | 6,451,842/sec | N/A          | --                               |
+    | Indexed lookup         | 118,897/sec   | 15,000/sec   | 7.9x                             |
+    | Range query            | 326,393/sec   | 50,000/sec   | 6.5x                             |
+    | ORDER BY + LIMIT       | 192,541/sec   | 20,000/sec   | 9.6x (heap-based top-k)          |
     +===========================================================================================+
 
+    benchmark environment: 28 CPU cores
 
-    peak throughput achieved: 200,000+ ops/sec (turbo mode, persistent storage)
-    peak throughput in-memory: 500,000+ ops/sec
+    peak throughput achieved: 6,639,669 ops/sec (sustained load, 10 seconds)
+    peak burst throughput:    6,677,726 ops/sec
+    total benchmark:          68,994,200 ops in 13 seconds (5,219,035 ops/sec avg)
 
 
 ------------------------------------------------------------------------------------------
@@ -289,28 +291,18 @@ api endpoints:
 
     POST /query
     -------------------------------------------------------------------------------------
-    execute a single query
+    execute queries OR batch insert (unified endpoint)
 
-    request:  { "query": "find users where age > 21" }
-    response: { "success": true, "data": "[{...}, {...}]" }
+    query request:  { "query": "find users where age > 21" }
+    query response: { "success": true, "data": "[{...}, {...}]" }
 
+    batch request:  { "table": "users", "rows": [{...}, {...}, ...] }
+    batch response: { "success": true, "inserted": 1000 }
 
-    POST /batch
-    -------------------------------------------------------------------------------------
-    batch insert (synchronous, waits for disk flush)
-
-    request:  { "table": "users", "rows": [{...}, {...}, ...] }
-    response: { "success": true, "inserted": 1000 }
-
-
-    POST /turbo
-    -------------------------------------------------------------------------------------
-    turbo batch insert (async, returns immediately)
-
-    request:  { "table": "users", "rows": [{...}, {...}, ...] }
-    response: { "success": true, "inserted": 1000 }
-
-    WARNING: data may be lost if server crashes before flush
+    durability depends on server mode:
+        - default:   async writes, eventual persistence
+        - --durable: WAL-backed, immediate durability (crash-safe)
+        - --memory:  no persistence (fastest)
 
 
     GET /health
@@ -346,13 +338,19 @@ usage:
     # build
     $ go build -o server ./src/cmd/
 
-    # run (persistent mode)
+    # run (default mode - fast, eventual persistence)
     $ ./server
     * fasty database server started on :8000
       using 8 CPU cores with fasthttp
 
+    # run (durable mode - WAL-backed, crash-safe)
+    $ ./server --durable
+    * fasty database server started on :8000
+      using 8 CPU cores with fasthttp
+      WAL enabled for immediate durability
+
     # run (in-memory mode - maximum speed, no persistence)
-    $ ./server -memory
+    $ ./server --memory
     * Starting in ULTRA-FAST in-memory mode (no persistence)
     * fasty database server started on :8000
 
@@ -366,11 +364,7 @@ usage:
         -d '{"query": "insert users { id: 1, name: \"alice\", age: 25 }"}'
 
     # batch insert (1000 rows)
-    $ curl -X POST http://localhost:8000/batch \
-        -d '{"table": "users", "rows": [{"id": 1, "name": "user1"}, ...]}'
-
-    # turbo insert (async, maximum speed)
-    $ curl -X POST http://localhost:8000/turbo \
+    $ curl -X POST http://localhost:8000/query \
         -d '{"table": "users", "rows": [{"id": 1, "name": "user1"}, ...]}'
 
     # query
@@ -386,21 +380,42 @@ usage:
     $ ./server &
     $ go run benchmark_ultra.go
 
-    expected output:
+    example output (28 CPU cores):
 
-    +============================================================================+
-    |           * FASTY ULTRA BENCHMARK - TARGETING 200K+ OPS/SEC                |
-    +============================================================================+
+    ============================================================
+    Fasty Benchmark - 28 CPU cores
+    ============================================================
 
-    [*] Test 1: Single Inserts (baseline)
-        > 10000 ops in 1.2s = 8333 ops/sec
+    [1] Single INSERT (baseline)
+    5000 ops in 85ms (58780 ops/sec)
 
-    [*] Test 3: /turbo endpoint (1000 rows/batch) - ASYNC WRITES
-        > 100000 ops in 0.8s = 125000 ops/sec
+    [2] Batch INSERT via /query
+      batch size 100: 100000 ops in 552ms (181276 ops/sec)
+      batch size 500: 100000 ops in 211ms (474684 ops/sec)
+      batch size 1000: 100000 ops in 578ms (172996 ops/sec)
 
-    [*] Test 7: Parallel /turbo (10000 rows/batch, 100 workers)
-        > 2000000 ops in 9.5s = 210526 ops/sec
-        ACHIEVED 200K+ OPS/SEC!
+    [3] Parallel /query
+      200k rows, 1000/batch, 10 workers: 200000 ops in 114ms (1749806 ops/sec)
+      500k rows, 2000/batch, 20 workers: 480000 ops in 114ms (4193131 ops/sec)
+      1000k rows, 5000/batch, 50 workers: 1000000 ops in 155ms (6451842 ops/sec)
+
+    [6] Query performance
+      index lookup: 2000 queries in 17ms (118897 q/sec)
+      range query: 500 queries in 2ms (326393 q/sec)
+      order by + limit: 200 queries in 1ms (192541 q/sec)
+
+    [7] Sustained load (10 seconds)
+    66411500 ops in 10.002s (6639669 ops/sec avg)
+
+    [9] Latency distribution
+      single inserts: p50=406us p95=1.026ms p99=1.77ms
+      batch inserts: p50=1.871ms p95=3.751ms p99=4.493ms
+
+    ============================================================
+    Total operations: 68994200
+    Total time: 13s
+    Total throughput: 5219035 ops/sec
+    ============================================================
 
 
 <========================================================================================>
@@ -414,8 +429,8 @@ comparison with postgresql:
     | Feature                     | fasty               | PostgreSQL          |
     +-----------------------------+---------------------+---------------------+
     | ACID Transactions           | [x] No              | [+] Yes             |
-    | Durability Guarantee        | [~] Eventual        | [+] Immediate       |
-    | Write Throughput            | [+] 200k+ ops/sec   | [~] 30k ops/sec     |
+    | Durability Guarantee        | [+] Configurable    | [+] Immediate       |
+    | Write Throughput            | [+] 6M+ ops/sec     | [~] 30k ops/sec     |
     | Complex JOINs               | [x] No              | [+] Yes             |
     | Stored Procedures           | [x] No              | [+] Yes             |
     | Replication                 | [x] No              | [+] Yes             |
@@ -445,7 +460,6 @@ comparison with postgresql:
     DON'T USE FASTY FOR:
         - financial transactions requiring ACID
         - complex relational queries with JOINs
-        - systems requiring immediate durability
         - multi-region replication
         - production systems requiring battle-tested reliability
 
@@ -454,12 +468,27 @@ comparison with postgresql:
 internals:
 
 ------------------------------------------------------------------------------------------
-|                              async writer pipeline                                     |
+|                              server modes                                              |
+------------------------------------------------------------------------------------------
+
+    fasty supports three operating modes:
+
+    +-------------------+------------------+------------------+------------------+
+    | Mode              | Throughput       | Durability       | Use Case         |
+    +-------------------+------------------+------------------+------------------+
+    | default           | 200k+ ops/sec    | Eventual         | Analytics, logs  |
+    | --durable         | 50k+ ops/sec     | Immediate (WAL)  | Important data   |
+    | --memory          | 500k+ ops/sec    | None             | Caching, dev     |
+    +-------------------+------------------+------------------+------------------+
+
+
+------------------------------------------------------------------------------------------
+|                              async writer pipeline (default mode)                      |
 ------------------------------------------------------------------------------------------
 
     the async writer is the key to fasty's speed. here's how it works:
 
-    1. request arrives at /turbo endpoint
+    1. request arrives at /query endpoint
     2. rows are encoded and added to in-memory buffer
     3. response returns immediately (sub-millisecond)
     4. background: when buffer reaches 10k ops OR 50ms passes:
@@ -503,6 +532,45 @@ internals:
 
 
 ------------------------------------------------------------------------------------------
+|                              WAL pipeline (--durable mode)                             |
+------------------------------------------------------------------------------------------
+
+    when --durable is enabled, writes go through a Write-Ahead Log first:
+
+    1. request arrives at /query endpoint
+    2. rows are encoded and written to WAL (sequential append)
+    3. WAL is fsynced to disk (batch sync for efficiency)
+    4. response returns (data is now crash-safe)
+    5. background: data is asynchronously written to LSM tree
+
+    WAL format:
+    +--------+--------+--------+--------+--------+--------+
+    | magic  | length |  crc32 | keylen |  key   | value  |
+    | 4B     | 4B     |  4B    | 4B     |  var   | var    |
+    +--------+--------+--------+--------+--------+--------+
+
+    recovery:
+        on startup, WAL is replayed to recover uncommitted data.
+        after replay, WAL is cleared and LSM is flushed.
+
+    code path:
+
+    handleTurbo()
+         |
+         v
+    DurableInserter.InsertMaps()
+         |
+         v
+    DurableWriter.WriteBatch()
+         |
+         +---> WAL.WriteBatch() --> fsync (immediate durability)
+         |
+         +---> buffer append
+         |
+         +---> async flush to LSM (background)
+
+
+------------------------------------------------------------------------------------------
 |                              LSM tree configuration                                    |
 ------------------------------------------------------------------------------------------
 
@@ -526,17 +594,18 @@ internals:
 <========================================================================================>
 source files:
 
-    src/cmd/main.go              - HTTP server, endpoint handlers
-    src/cmd/engine/engine.go     - query parser, executor, catalog
-    src/cmd/engine/batch.go      - batch insert implementations
-    src/cmd/engine/async_writer.go - async write pipeline
-    src/cmd/engine/fast_scan.go  - parallel scan, heap-based ORDER BY
-    src/cmd/engine/mapping.go    - key-value encoding/decoding
-    src/cmd/engine/cache.go      - query cache, result cache
-    src/LSMTree/tree.go          - moss LSM wrapper
+    src/cmd/main.go                  - HTTP server, endpoint handlers
+    src/cmd/engine/engine.go         - query parser, executor, catalog
+    src/cmd/engine/batch.go          - batch insert implementations
+    src/cmd/engine/async_writer.go   - async write pipeline (default mode)
+    src/cmd/engine/durable_writer.go - WAL-backed write pipeline (--durable mode)
+    src/cmd/engine/wal.go            - Write-Ahead Log implementation
+    src/cmd/engine/fast_scan.go      - parallel scan, heap-based ORDER BY
+    src/cmd/engine/mapping.go        - key-value encoding/decoding
+    src/cmd/engine/cache.go          - query cache, result cache
+    src/LSMTree/tree.go              - moss LSM wrapper
 
-    benchmark_ultra.go           - performance benchmark
-    import_turbo.go              - CSV import script
+    benchmark_ultra.go               - performance benchmark
 
 
 <========================================================================================>

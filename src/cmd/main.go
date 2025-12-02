@@ -17,6 +17,7 @@ import (
 )
 
 var inMemoryMode = flag.Bool("memory", false, "Run in ultra-fast in-memory mode (no persistence)")
+var durableMode = flag.Bool("durable", false, "Enable WAL for immediate durability (slower but crash-safe)")
 
 type QueryRequest struct {
 	Query string `json:"query"`
@@ -56,11 +57,12 @@ func main() {
 
 	var err error
 	if *inMemoryMode {
-		log.Println("🚀 Starting in ULTRA-FAST in-memory mode (no persistence)")
+		log.Println("Starting in ULTRA-FAST in-memory mode (no persistence)")
 		db, err = engine.NewInMemoryDB()
 	} else {
 		db, err = engine.NewRelationalDB("./data")
 	}
+	useDurable = *durableMode && !*inMemoryMode
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
@@ -90,6 +92,16 @@ func main() {
 		<-sigChan
 
 		log.Println("shutting down...")
+
+		turboMu.Lock()
+		for _, di := range durableInserters {
+			di.Close()
+		}
+		for _, ti := range turboInserters {
+			ti.Flush()
+		}
+		turboMu.Unlock()
+
 		server.Shutdown()
 
 		if err := db.Close(); err != nil {
@@ -98,8 +110,11 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("⚡ fasty database server started on :8000")
+	log.Printf("fasty database server started on :8000")
 	log.Printf("   using %d CPU cores with fasthttp", runtime.NumCPU())
+	if useDurable {
+		log.Printf("   WAL enabled for immediate durability")
+	}
 
 	if err := server.ListenAndServe(":8000"); err != nil {
 		log.Fatal("error starting server: ", err)
@@ -107,7 +122,9 @@ func main() {
 }
 
 var turboInserters = make(map[string]*engine.HighSpeedInserter)
+var durableInserters = make(map[string]*engine.DurableInserter)
 var turboMu sync.Mutex
+var useDurable bool
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
 	path := string(ctx.Path())
@@ -154,22 +171,45 @@ func handleTurbo(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	turboMu.Lock()
-	inserter, exists := turboInserters[req.Table]
-	if !exists {
-		var err error
-		inserter, err = db.NewHighSpeedInserter(req.Table)
-		if err != nil {
-			turboMu.Unlock()
-			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+	if useDurable {
+		turboMu.Lock()
+		dinserter, exists := durableInserters[req.Table]
+		if !exists {
+			var err error
+			dinserter, err = db.NewDurableInserter(req.Table, "./data/wal")
+			if err != nil {
+				turboMu.Unlock()
+				ctx.SetStatusCode(fasthttp.StatusBadRequest)
+				writeError(ctx, err.Error())
+				return
+			}
+			durableInserters[req.Table] = dinserter
+		}
+		turboMu.Unlock()
+
+		if err := dinserter.InsertMaps(req.Rows); err != nil {
+			ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 			writeError(ctx, err.Error())
 			return
 		}
-		turboInserters[req.Table] = inserter
-	}
-	turboMu.Unlock()
+	} else {
+		turboMu.Lock()
+		inserter, exists := turboInserters[req.Table]
+		if !exists {
+			var err error
+			inserter, err = db.NewHighSpeedInserter(req.Table)
+			if err != nil {
+				turboMu.Unlock()
+				ctx.SetStatusCode(fasthttp.StatusBadRequest)
+				writeError(ctx, err.Error())
+				return
+			}
+			turboInserters[req.Table] = inserter
+		}
+		turboMu.Unlock()
 
-	inserter.InsertMaps(req.Rows)
+		inserter.InsertMaps(req.Rows)
+	}
 
 	resp := BatchResponse{Success: true, Inserted: len(req.Rows)}
 	data, _ := json.Marshal(resp)
@@ -209,10 +249,4 @@ func writeError(ctx *fasthttp.RequestCtx, msg string) {
 	resp := Response{Success: false, Error: msg}
 	data, _ := json.Marshal(resp)
 	ctx.SetBody(data)
-}
-
-func writeSuccess(ctx *fasthttp.RequestCtx, data string) {
-	resp := Response{Success: true, Data: data}
-	result, _ := json.Marshal(resp)
-	ctx.SetBody(result)
 }
