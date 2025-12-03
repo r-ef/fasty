@@ -107,3 +107,5 @@ dashboard/node_modules/
 dashboard/dist/
 dashboard/
 Transactions_clean.csv
+import_csv.go
+server
