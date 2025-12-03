@@ -1,0 +1,11 @@
+id,name,value,active,category,timestamp
+1,Alice,100.50,true,electronics,1640995200
+2,Bob,250.75,false,clothing,1641081600
+3,Charlie,75.25,true,books,1641168000
+4,Diana,300.00,false,toys,1641254400
+5,Eve,125.30,true,sports,1641340800
+6,Frank,450.90,false,home,1641427200
+7,Grace,80.15,true,garden,1641513600
+8,Henry,675.25,false,auto,1641600000
+9,Ivy,95.40,true,kitchen,1641686400
+10,Jack,320.80,false,electronics,1641772800

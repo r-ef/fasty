@@ -418,6 +418,19 @@ func NewInMemoryDB() (*RelationalDB, error) {
 	return db, nil
 }
 
+func (db *RelationalDB) findIndexForColumn(tableName, columnName string) *IndexSchema {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if indexes, ok := db.tableIndex[tableName]; ok {
+		for _, idx := range indexes {
+			if idx.Column == columnName {
+				return idx
+			}
+		}
+	}
+	return nil
+}
+
 func (db *RelationalDB) Close() error {
 	return db.kv.Close()
 }
@@ -1396,6 +1409,7 @@ func compareInterface(a, b interface{}) int {
 func (db *RelationalDB) handleUpdate(cmd *UpdateCmd) (string, error) {
 	db.mu.RLock()
 	schema, exists := db.catalog[cmd.Table]
+	tableIndexes := db.tableIndex[cmd.Table]
 	db.mu.RUnlock()
 	if !exists {
 		return "", fmt.Errorf("table '%s' does not exist", cmd.Table)
@@ -1406,8 +1420,13 @@ func (db *RelationalDB) handleUpdate(cmd *UpdateCmd) (string, error) {
 		return "", err
 	}
 
-	var kvPairs [][2][]byte
+	var setPairs [][2][]byte
+	var deleteKeys [][]byte
 	for _, row := range rows {
+		// Store old values for index updates
+		oldRow := make([]interface{}, len(row.Data))
+		copy(oldRow, row.Data)
+
 		for _, assign := range cmd.Assignments {
 			colIdx := schema.GetColumnIndex(assign.Column)
 			if colIdx == -1 {
@@ -1421,11 +1440,42 @@ func (db *RelationalDB) handleUpdate(cmd *UpdateCmd) (string, error) {
 			return "", err
 		}
 		key := db.encoder.EncodeKey(schema.ID, row.PrimaryKey)
-		kvPairs = append(kvPairs, [2][]byte{key, valBytes})
+		setPairs = append(setPairs, [2][]byte{key, valBytes})
+
+		// Update indexes
+		for _, idx := range tableIndexes {
+			if idx.ColIdx >= 0 && idx.ColIdx < len(oldRow) {
+				oldVal := oldRow[idx.ColIdx]
+				newVal := row.Data[idx.ColIdx]
+
+				// Delete old index entry
+				if oldVal != nil {
+					oldIndexKey := db.encodeIndexKey(idx.ID, oldVal, row.PrimaryKey)
+					deleteKeys = append(deleteKeys, oldIndexKey)
+				}
+
+				// Add new index entry
+				if newVal != nil {
+					newIndexKey := db.encodeIndexKey(idx.ID, newVal, row.PrimaryKey)
+					pkBytes := make([]byte, 8)
+					binary.BigEndian.PutUint64(pkBytes, row.PrimaryKey)
+					setPairs = append(setPairs, [2][]byte{newIndexKey, pkBytes})
+
+					if idx.bloom != nil {
+						idx.bloom.Add(valueToBytes(newVal))
+					}
+				}
+			}
+		}
 	}
 
-	if len(kvPairs) > 0 {
-		if err := db.kv.BatchSet(kvPairs); err != nil {
+	if len(setPairs) > 0 {
+		if err := db.kv.BatchSet(setPairs); err != nil {
+			return "", err
+		}
+	}
+	if len(deleteKeys) > 0 {
+		if err := db.kv.BatchWrite(nil, deleteKeys); err != nil {
 			return "", err
 		}
 	}
@@ -1436,6 +1486,7 @@ func (db *RelationalDB) handleUpdate(cmd *UpdateCmd) (string, error) {
 func (db *RelationalDB) handleDelete(cmd *DeleteCmd) (string, error) {
 	db.mu.RLock()
 	schema, exists := db.catalog[cmd.Table]
+	tableIndexes := db.tableIndex[cmd.Table]
 	db.mu.RUnlock()
 	if !exists {
 		return "", fmt.Errorf("table '%s' does not exist", cmd.Table)
@@ -1450,6 +1501,17 @@ func (db *RelationalDB) handleDelete(cmd *DeleteCmd) (string, error) {
 	for _, row := range rows {
 		key := db.encoder.EncodeKey(schema.ID, row.PrimaryKey)
 		keys = append(keys, key)
+
+		// Delete from indexes
+		for _, idx := range tableIndexes {
+			if idx.ColIdx >= 0 && idx.ColIdx < len(row.Data) {
+				val := row.Data[idx.ColIdx]
+				if val != nil {
+					indexKey := db.encodeIndexKey(idx.ID, val, row.PrimaryKey)
+					keys = append(keys, indexKey)
+				}
+			}
+		}
 	}
 
 	if len(keys) > 0 {
@@ -1458,7 +1520,7 @@ func (db *RelationalDB) handleDelete(cmd *DeleteCmd) (string, error) {
 		}
 	}
 
-	return fmt.Sprintf("Deleted %d row(s)", len(keys)), nil
+	return fmt.Sprintf("Deleted %d row(s)", len(rows)), nil
 }
 
 func (db *RelationalDB) handleDrop(cmd *DropCmd) (string, error) {

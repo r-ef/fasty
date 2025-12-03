@@ -3,9 +3,9 @@ package engine
 import (
 	"container/heap"
 	"encoding/binary"
-	"runtime"
+	"sort"
 	"strings"
-	"sync"
+	"unsafe"
 )
 
 type TopKHeap struct {
@@ -18,7 +18,17 @@ type TopKHeap struct {
 func (h TopKHeap) Len() int { return len(h.rows) }
 
 func (h TopKHeap) Less(i, j int) bool {
-	cmp := compareInterface(h.rows[i].Data[h.colIdx], h.rows[j].Data[h.colIdx])
+	var cmp int
+	if h.colIdx < len(h.rows[i].Data) && h.colIdx < len(h.rows[j].Data) {
+		cmp = compareInterface(h.rows[i].Data[h.colIdx], h.rows[j].Data[h.colIdx])
+	} else if h.colIdx < len(h.rows[i].Data) {
+		cmp = -1
+	} else if h.colIdx < len(h.rows[j].Data) {
+		cmp = 1
+	} else {
+		cmp = 0
+	}
+
 	if h.desc {
 		return cmp < 0
 	}
@@ -50,11 +60,46 @@ func (db *RelationalDB) FastQuery(schema *TableSchema, where *WhereClause, order
 	}
 	defer iter.Close()
 
-	if orderBy != nil && limit != nil && *limit > 0 {
+	if orderBy != nil && limit != nil {
+		// Check if there's an index on the orderBy column
+		if idx := db.findIndexForColumn(schema.Name, orderBy.Column); idx != nil {
+			return db.fastQueryWithIndex(idx, schema, matchers, where, orderBy, *limit, offset)
+		}
 		return db.fastQueryWithHeap(iter, schema, matchers, where, orderBy, *limit, offset)
 	}
 
-	return db.fastParallelScan(iter, schema, matchers, where, limit, offset)
+	var results []Row
+	for {
+		key, val, err := iter.Current()
+		if err != nil {
+			break
+		}
+
+		decoded, err := db.encoder.DecodeValue(val)
+		if err != nil {
+			iter.Next()
+			continue
+		}
+
+		if where != nil && !db.matchesFilterFast(schema, decoded, where, matchers) {
+			iter.Next()
+			continue
+		}
+
+		pk := binary.BigEndian.Uint64(key[4:12])
+		row := Row{PrimaryKey: pk, Data: decoded}
+		results = append(results, row)
+
+		if limit != nil && len(results) >= *limit {
+			break
+		}
+
+		if err := iter.Next(); err != nil {
+			break
+		}
+	}
+
+	return results, nil
 }
 
 type CompiledCondition struct {
@@ -272,6 +317,10 @@ func (db *RelationalDB) fastQueryWithHeap(iter interface {
 		colIdx = 0
 	}
 
+	if colIdx >= len(schema.Columns) {
+		colIdx = 0
+	}
+
 	need := limit
 	if offset != nil {
 		need += *offset
@@ -305,6 +354,11 @@ func (db *RelationalDB) fastQueryWithHeap(iter interface {
 		pk := binary.BigEndian.Uint64(key[4:12])
 		row := Row{PrimaryKey: pk, Data: decoded}
 
+		if len(decoded) != len(schema.Columns) {
+			iter.Next()
+			continue
+		}
+
 		heap.Push(h, row)
 
 		if h.Len() > need {
@@ -335,146 +389,146 @@ func (db *RelationalDB) fastQueryWithHeap(iter interface {
 	return result, nil
 }
 
-func (db *RelationalDB) matchesFilterFast(schema *TableSchema, data []interface{}, where *WhereClause, matchers []*CompiledCondition) bool {
-	if matchers != nil {
-		return matchConditions(matchers, data)
-	}
-	row := Row{Data: data}
-	return db.matchesFilter(schema, row, where)
+type IndexItem struct {
+	pk  uint64
+	key []byte
 }
 
-func (db *RelationalDB) fastParallelScan(iter interface {
-	Current() ([]byte, []byte, error)
-	Next() error
-}, schema *TableSchema, matchers []*CompiledCondition, where *WhereClause, limit *int, offset *int) ([]Row, error) {
-	type kvPair struct {
-		key []byte
-		val []byte
+func decodeValueFromKey(key []byte) interface{} {
+	if len(key) < 5 {
+		return nil
 	}
-	var pairs []kvPair
+	typeByte := key[4]
+	data := key[5 : len(key)-8]
+	switch typeByte {
+	case 1: // int
+		if len(data) == 8 {
+			return int(binary.BigEndian.Uint64(data))
+		}
+	case 2: // float
+		if len(data) == 8 {
+			bits := binary.BigEndian.Uint64(data)
+			return *(*float64)(unsafe.Pointer(&bits))
+		}
+	case 3: // string
+		if len(data) > 0 {
+			return string(data[:len(data)-1]) // remove null
+		}
+	case 4: // bool
+		return data[0] == 1
+	}
+	return nil
+}
 
+func (db *RelationalDB) fastQueryWithIndex(idx *IndexSchema, schema *TableSchema, matchers []*CompiledCondition, where *WhereClause, orderBy *OrderClause, limit int, offset *int) ([]Row, error) {
+	prefix := make([]byte, 4)
+	binary.BigEndian.PutUint32(prefix, idx.ID+1000)
+	iter, err := db.kv.NewPrefixIterator(prefix)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+
+	desc := strings.EqualFold(orderBy.Direction, "DESC")
+	need := limit
+	if offset != nil {
+		need += *offset
+	}
+
+	var items []IndexItem
 	for {
 		key, val, err := iter.Current()
 		if err != nil {
 			break
 		}
+
+		if len(val) != 8 {
+			iter.Next()
+			continue
+		}
+		pk := binary.BigEndian.Uint64(val)
+
+		if where != nil {
+			// Fetch the full row to apply WHERE
+			rowKey := db.encoder.EncodeKey(schema.ID, pk)
+			rowVal, err := db.kv.Get(rowKey)
+			if err != nil || rowVal == nil {
+				iter.Next()
+				continue
+			}
+
+			decoded, err := db.encoder.DecodeValue(rowVal)
+			if err != nil {
+				iter.Next()
+				continue
+			}
+
+			// Apply WHERE filter
+			if !db.matchesFilterFast(schema, decoded, where, matchers) {
+				iter.Next()
+				continue
+			}
+		}
+
 		keyCopy := make([]byte, len(key))
 		copy(keyCopy, key)
-		valCopy := make([]byte, len(val))
-		copy(valCopy, val)
-		pairs = append(pairs, kvPair{keyCopy, valCopy})
+		items = append(items, IndexItem{pk: pk, key: keyCopy})
+
+		if !desc && len(items) >= need {
+			break
+		}
 
 		if err := iter.Next(); err != nil {
 			break
 		}
 	}
 
-	if len(pairs) == 0 {
-		return []Row{}, nil
+	if desc {
+		// Sort items by value DESC
+		sort.Slice(items, func(i, j int) bool {
+			vi := decodeValueFromKey(items[i].key)
+			vj := decodeValueFromKey(items[j].key)
+			cmp := compareInterface(vi, vj)
+			return cmp > 0 // DESC: larger first
+		})
 	}
 
-	if len(pairs) < 500 {
-		rows := make([]Row, 0, len(pairs))
-		for _, p := range pairs {
-			if matchers != nil && !db.matchesFilterRaw(p.val, matchers) {
-				continue
-			}
-
-			decoded, err := db.encoder.DecodeValue(p.val)
-			if err != nil {
-				continue
-			}
-
-			if where != nil && matchers == nil && !db.matchesFilter(schema, Row{Data: decoded}, where) {
-				continue
-			}
-
-			pk := binary.BigEndian.Uint64(p.key[4:12])
-			rows = append(rows, Row{PrimaryKey: pk, Data: decoded})
-		}
-
-		if offset != nil && *offset > 0 {
-			if *offset >= len(rows) {
-				return []Row{}, nil
-			}
-			rows = rows[*offset:]
-		}
-		if limit != nil && *limit >= 0 && *limit < len(rows) {
-			rows = rows[:*limit]
-		}
-
-		return rows, nil
+	// Take only needed
+	if len(items) > need {
+		items = items[:need]
 	}
 
-	numWorkers := runtime.NumCPU() * 2
-	if numWorkers > 16 {
-		numWorkers = 16
-	}
-
-	chunkSize := (len(pairs) + numWorkers - 1) / numWorkers
-	results := make([][]Row, numWorkers)
-
-	var wg sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
-		start := w * chunkSize
-		end := start + chunkSize
-		if end > len(pairs) {
-			end = len(pairs)
-		}
-		if start >= len(pairs) {
-			break
-		}
-
-		wg.Add(1)
-		go func(workerID, start, end int) {
-			defer wg.Done()
-
-			localRows := make([]Row, 0, (end-start)/2)
-
-			for i := start; i < end; i++ {
-				p := pairs[i]
-				if matchers != nil && !db.matchesFilterRaw(p.val, matchers) {
-					continue
-				}
-
-				decoded, err := db.encoder.DecodeValue(p.val)
-				if err != nil {
-					continue
-				}
-
-				if where != nil && matchers == nil && !db.matchesFilter(schema, Row{Data: decoded}, where) {
-					continue
-				}
-
-				pk := binary.BigEndian.Uint64(p.key[4:12])
-				localRows = append(localRows, Row{PrimaryKey: pk, Data: decoded})
-			}
-
-			results[workerID] = localRows
-		}(w, start, end)
-	}
-
-	wg.Wait()
-
-	totalLen := 0
-	for _, r := range results {
-		totalLen += len(r)
-	}
-
-	rows := make([]Row, 0, totalLen)
-	for _, r := range results {
-		rows = append(rows, r...)
-	}
-
+	// Apply offset
 	if offset != nil && *offset > 0 {
-		if *offset >= len(rows) {
+		if *offset >= len(items) {
 			return []Row{}, nil
 		}
-		rows = rows[*offset:]
+		items = items[*offset:]
 	}
-	if limit != nil && *limit >= 0 && *limit < len(rows) {
-		rows = rows[:*limit]
+
+	// Fetch rows
+	var rows []Row
+	for _, item := range items {
+		rowKey := db.encoder.EncodeKey(schema.ID, item.pk)
+		rowVal, err := db.kv.Get(rowKey)
+		if err != nil || rowVal == nil {
+			continue
+		}
+		decoded, err := db.encoder.DecodeValue(rowVal)
+		if err != nil {
+			continue
+		}
+		row := Row{PrimaryKey: item.pk, Data: decoded}
+		rows = append(rows, row)
 	}
 
 	return rows, nil
+}
+
+func (db *RelationalDB) matchesFilterFast(schema *TableSchema, data []interface{}, where *WhereClause, matchers []*CompiledCondition) bool {
+	if matchers != nil {
+		return matchConditions(matchers, data)
+	}
+	row := Row{Data: data}
+	return db.matchesFilter(schema, row, where)
 }
