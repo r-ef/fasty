@@ -1,7 +1,7 @@
 package memstore
 
 import (
-	"github.com/r-ef/moss"
+	"github.com/couchbase/moss"
 )
 
 type Wrapper struct {

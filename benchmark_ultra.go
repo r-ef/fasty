@@ -16,7 +16,7 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-const baseURL = "http:
+const baseURL = "http://localhost:8000"
 
 var client = &fasthttp.Client{
 	MaxConnsPerHost:               2000,
