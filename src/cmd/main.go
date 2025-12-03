@@ -111,13 +111,13 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("fasty database server started on :8000")
+	log.Printf("fasty database server started on :1337")
 	log.Printf("   using %d CPU cores with fasthttp", runtime.NumCPU())
 	if useDurable {
 		log.Printf("   WAL enabled for immediate durability")
 	}
 
-	if err := server.ListenAndServe(":8000"); err != nil {
+	if err := server.ListenAndServe(":1337"); err != nil {
 		log.Fatal("error starting server: ", err)
 	}
 }
