@@ -106,3 +106,4 @@ mem.prof
 dashboard/node_modules/
 dashboard/dist/
 dashboard/
+Transactions_clean.csv
