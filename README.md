@@ -62,19 +62,20 @@ performance characteristics:
     +===========================================================================================+
     | Operation              | fasty         | PostgreSQL   | Speedup                          |
     +===========================================================================================+
-    | Single INSERT          | 58,780/sec    | 5,000/sec    | 11.7x                            |
-    | Batch INSERT (1000)    | 172,996/sec   | 30,000/sec   | 5.8x                             |
-    | Parallel batch (50w)   | 6,451,842/sec | N/A          | --                               |
-    | Indexed lookup         | 118,897/sec   | 15,000/sec   | 7.9x                             |
-    | Range query            | 326,393/sec   | 50,000/sec   | 6.5x                             |
-    | ORDER BY + LIMIT       | 192,541/sec   | 20,000/sec   | 9.6x (heap-based top-k)          |
+    | Single INSERT          | 154,230/sec   | 5,000/sec    | 30.8x                            |
+    | Batch INSERT (1000)    | 511,911/sec   | 30,000/sec   | 17.0x                            |
+    | Parallel batch (50w)   | 4,616,352/sec | N/A          | --                               |
+    | Indexed lookup         | 316,571/sec   | 15,000/sec   | 21.1x                            |
+    | Range query            | 207,175/sec   | 50,000/sec   | 4.1x                             |
+    | ORDER BY + LIMIT       | 155,669/sec   | 20,000/sec   | 7.8x (heap-based top-k)          |
+    | JOIN (Inner)           | 160,382/sec   | 10,000/sec   | 16.0x                            |
     +===========================================================================================+
 
     benchmark environment: 28 CPU cores
 
-    peak throughput achieved: 6,639,669 ops/sec (sustained load, 10 seconds)
-    peak burst throughput:    6,677,726 ops/sec
-    total benchmark:          68,994,200 ops in 13 seconds (5,219,035 ops/sec avg)
+    peak throughput achieved: 4,668,148 ops/sec (sustained load, 10 seconds)
+    peak burst throughput:    4,265,558 ops/sec
+    total benchmark:          49,284,200 ops in 13 seconds (3,876,352 ops/sec avg)
 
 
 ------------------------------------------------------------------------------------------
@@ -93,23 +94,43 @@ performance characteristics:
 
     2. MASSIVE BATCH SIZES
        -------------------------------------------------------------------------------------
-       fasty batches up to 10,000 operations before flushing to disk.
+       fasty batches up to 20,000 operations before flushing to disk.
        this amortizes the cost of disk seeks across many operations.
 
        postgres default:  ~100 ops per WAL flush
-       fasty:             10,000 ops per batch flush
+       fasty:             20,000 ops per batch flush
 
 
-    3. LSM TREE OPTIMIZATIONS
+    3. LSM TREE OPTIMIZATIONS (TIERED COMPACTION)
        -------------------------------------------------------------------------------------
-       the underlying moss LSM tree is tuned for write throughput:
-           - 256 pre-merger batches in memory
-           - compaction disabled during hot writes
-           - 16MB compaction buffer
+       the underlying moss LSM tree is tuned for write throughput using a tiered-like strategy:
+           - 1024+ pre-merger batches in memory (delays merging)
+           - increased merge timeout (200ms) to allow larger batches
+           - 32MB compaction buffer
            - async sync (NoSync: true)
 
 
-    4. HEAP-BASED TOP-K FOR ORDER BY + LIMIT
+    4. ZSTD COMPRESSION & BLOCK CACHE
+       -------------------------------------------------------------------------------------
+       all data is compressed using Zstd before storage, reducing disk usage and
+       I/O bandwidth. an in-memory LRU block cache stores hot uncompressed values
+       to eliminate decompression overhead for frequent reads.
+
+
+    5. ASYNC PREFETCH ITERATORS
+       -------------------------------------------------------------------------------------
+       iterators run a background goroutine to prefetch and decompress the next
+       items while the query engine processes the current ones. this overlaps
+       CPU (decompression) and I/O latency.
+
+
+    6. FINE-GRAINED WRITE THROTTLING
+       -------------------------------------------------------------------------------------
+       writes are rate-limited (~50MB/s) to prevent "IO storms" and unbounded
+       memory growth during massive ingestion spikes, ensuring stable latency.
+
+
+    7. HEAP-BASED TOP-K FOR ORDER BY + LIMIT
        -------------------------------------------------------------------------------------
        instead of sorting all rows then taking top N (O(n log n)),
        fasty maintains a heap of size K (O(n log k)).
@@ -119,13 +140,13 @@ performance characteristics:
            fasty:       heap of size 10           -> O(n log 10) ~ O(n)
 
 
-    5. PARALLEL TABLE SCANS
+    8. PARALLEL TABLE SCANS
        -------------------------------------------------------------------------------------
        large table scans are parallelized across all CPU cores.
        rows are decoded and filtered concurrently.
 
 
-    6. PRE-COMPILED WHERE CONDITIONS
+    9. PRE-COMPILED WHERE CONDITIONS
        -------------------------------------------------------------------------------------
        WHERE clauses are compiled once into optimized matchers.
        no runtime type checking during row filtering.
@@ -163,17 +184,19 @@ architecture:
     +---------------------------------------------------------------------------------+
                                            |
                                            v
-    +---------------------------------------------------------------------------------+
-    |                              STORAGE LAYER (moss LSM)                           |
-    |                                                                                 |
-    |   +--------------+  +--------------+  +--------------+  +--------------+       |
-    |   | MemTable     |  | MemTable     |  | SSTable L0   |  | SSTable L1   |       |
-    |   | (active)     |  | (frozen)     |  | (recent)     |  | (compacted)  |       |
-    |   +--------------+  +--------------+  +--------------+  +--------------+       |
-    |                                                                                 |
-    |   256 pre-merger batches | 5000 ops per batch | async compaction               |
-    |                                                                                 |
-    +---------------------------------------------------------------------------------+
+     +---------------------------------------------------------------------------------+
+     |                        STORAGE LAYER (custom moss LSM)                          |
+     |                                                                                 |
+     |   +--------------+  +--------------+  +--------------+  +--------------+       |
+     |   | MemTable     |  | MemTable     |  | SSTable L0   |  | SSTable L1   |       |
+     |   | (active)     |  | MemTable     |  | (recent)     |  | (compacted)  |       |
+     |   | (frozen)     |  |              |  |              |  |              |       |
+     |   +--------------+  +--------------+  +--------------+  +--------------+       |
+     |                                                                                 |
+     |   1024 pre-merger batches | 5000 ops per batch | tiered compaction             |
+     |   Zstd compression | LRU block cache | tombstone delay | binary search merge   |
+     |                                                                                 |
+     +---------------------------------------------------------------------------------+
                                            |
                                            v
     +---------------------------------------------------------------------------------+
@@ -243,6 +266,11 @@ query language:
     select name, email from users where age > 21
 
     select * from users where active = true order by age desc limit 10 offset 20
+
+
+    JOIN (inner join)
+    -------------------------------------------------------------------------------------
+    select * from orders join users on orders.user_id = users.id limit 10
 
 
     FIND (alias for select)
@@ -431,7 +459,7 @@ comparison with postgresql:
     | ACID Transactions           | [x] No              | [+] Yes             |
     | Durability Guarantee        | [+] Configurable    | [+] Immediate       |
     | Write Throughput            | [+] 6M+ ops/sec     | [~] 30k ops/sec     |
-    | Complex JOINs               | [x] No              | [+] Yes             |
+    | Complex JOINs               | [~] Basic           | [+] Yes             |
     | Stored Procedures           | [x] No              | [+] Yes             |
     | Replication                 | [x] No              | [+] Yes             |
     | JSON Support                | [+] Native          | [+] JSONB           |
@@ -491,14 +519,14 @@ internals:
     1. request arrives at /query endpoint
     2. rows are encoded and added to in-memory buffer
     3. response returns immediately (sub-millisecond)
-    4. background: when buffer reaches 10k ops OR 50ms passes:
+    4. background: when buffer reaches 20k ops OR 50ms passes:
        - buffer is swapped with empty buffer (lock-free)
        - old buffer sent to flush channel
        - one of 4 flush workers picks it up
        - worker calls LSM BatchSet()
-    5. LSM batches another 5k ops before disk write
+    5. LSM batches another 20k ops before disk write
 
-    total batching: 10k (async buffer) x 5k (LSM) = potential 50k ops per disk write
+    total batching: 20k (async buffer) x 20k (LSM) = potential 400k ops per disk write
 
     code path:
 
@@ -512,7 +540,7 @@ internals:
          |
          +---> buffer append (mutex-protected)
          |
-         +---> if len(buffer) >= 10000:
+         +---> if len(buffer) >= 20000:
                   |
                   v
               FlushAsync()
@@ -574,21 +602,53 @@ internals:
 |                              LSM tree configuration                                    |
 ------------------------------------------------------------------------------------------
 
-    moss (couchbase's LSM implementation) settings:
+    moss (custom fork: github.com/r-ef/moss) settings:
 
     CollectionOptions:
-        MergerIdleRunTimeoutMS: 10      // fast merger
-        MaxPreMergerBatches:    256     // huge memory buffer
-        MinMergePercentage:     0.0     // no forced merging
+        MergerIdleRunTimeoutMS: 200     // batched merger (tiered-like)
+        MaxPreMergerBatches:    1024    // huge memory buffer
+        MinMergePercentage:     0.8     // tiered compaction
 
     StoreOptions:
         CompactionPercentage:   0.3
-        CompactionBufferPages:  4096    // 16MB
+        CompactionBufferPages:  8192    // 32MB
         CompactionSync:         false
 
     PersistOptions:
         NoSync:                 true    // async fsync
         CompactionConcern:      Disable // no compaction during writes
+
+
+    moss optimizations implemented:
+
+    1. FASTER SEGMENT SORTING
+       -------------------------------------------------------------------------------------
+       replaced interface-based sort.Sort with slices.SortStableFunc using
+       unsafe.Pointer casting for zero-copy comparisons. eliminates heap allocations
+       and interface method calls during sorting.
+
+    2. MODERN GO FEATURES
+       -------------------------------------------------------------------------------------
+       updated to Go 1.25.4, replaced reflect.SliceHeader with unsafe.Slice,
+       optimized byte comparisons with bytes.Equal.
+
+    3. TOMBSTONE DELAY OPTIMIZATION
+       -------------------------------------------------------------------------------------
+       when merging segments with high deletion ratios (>60%), delays the merge
+       operation by 100ms to allow more writes that might cancel out deletions.
+       reduces unnecessary I/O for workloads with many temporary deletions.
+
+    4. BINARY SEARCH FOR LARGE BASE LAYERS
+       -------------------------------------------------------------------------------------
+       when the base layer is 5x larger than upper layers being merged (>10k entries),
+       uses binary search on the base layer instead of heap merging. optimizes
+       merging performance for write-heavy workloads with large accumulated data.
+
+    5. REDUCED MERGING AGGRESSIVENESS
+       -------------------------------------------------------------------------------------
+       disabled forced merging with dirty base segments during persister busy periods,
+       allowing CPU to focus on new incoming writes instead of re-merging data
+       queued for persistence.
 
 
 <========================================================================================>
@@ -603,7 +663,13 @@ source files:
     src/cmd/engine/fast_scan.go      - parallel scan, heap-based ORDER BY
     src/cmd/engine/mapping.go        - key-value encoding/decoding
     src/cmd/engine/cache.go          - query cache, result cache
-    src/LSMTree/tree.go              - moss LSM wrapper
+    src/LSMTree/tree.go              - moss LSM wrapper (with Zstd + LRU cache)
+
+    moss/                            - custom moss LSM fork (github.com/r-ef/moss)
+        - optimized segment sorting (slices.SortStableFunc)
+        - tombstone delay optimization
+        - binary search for large base layers
+        - modern Go 1.25.4 features
 
     benchmark_ultra.go               - performance benchmark
 

@@ -102,3 +102,7 @@ mem.prof
 *.backup
 *~
 
+# Dashboard
+dashboard/node_modules/
+dashboard/dist/
+dashboard/

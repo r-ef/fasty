@@ -44,7 +44,6 @@ var db *engine.RelationalDB
 
 var (
 	healthResponse   = []byte(`{"success":true,"data":"ok"}`)
-	emptyQueryError  = []byte(`{"success":false,"error":"query cannot be empty"}`)
 	emptyBodyError   = []byte(`{"success":false,"error":"empty request body"}`)
 	methodNotAllowed = []byte(`{"success":false,"error":"only POST method allowed"}`)
 	contentTypeJSON  = []byte("application/json")
@@ -70,20 +69,22 @@ func main() {
 	server := &fasthttp.Server{
 		Handler:                       requestHandler,
 		Name:                          "fasty",
-		ReadTimeout:                   30 * time.Second,
-		WriteTimeout:                  60 * time.Second,
-		IdleTimeout:                   120 * time.Second,
-		MaxRequestBodySize:            100 << 20,
+		ReadTimeout:                   10 * time.Second,
+		WriteTimeout:                  30 * time.Second,
+		IdleTimeout:                   60 * time.Second,
+		MaxRequestBodySize:            200 << 20,
 		DisableKeepalive:              false,
 		TCPKeepalive:                  true,
-		TCPKeepalivePeriod:            60 * time.Second,
+		TCPKeepalivePeriod:            30 * time.Second,
 		ReduceMemoryUsage:             false,
 		GetOnly:                       false,
 		DisableHeaderNamesNormalizing: true,
 		NoDefaultServerHeader:         true,
 		NoDefaultDate:                 true,
 		NoDefaultContentType:          true,
-		Concurrency:                   256 * 1024,
+		Concurrency:                   512 * 1024,
+		ReadBufferSize:                64 * 1024,
+		WriteBufferSize:               64 * 1024,
 	}
 
 	go func() {
@@ -127,11 +128,20 @@ var turboMu sync.Mutex
 var useDurable bool
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
+	ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+	ctx.Response.Header.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	ctx.Response.Header.Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if string(ctx.Method()) == "OPTIONS" {
+		ctx.SetStatusCode(fasthttp.StatusOK)
+		return
+	}
+
 	path := string(ctx.Path())
 
 	switch path {
 	case "/query":
-		handleTurbo(ctx)
+		handleQuery(ctx)
 	case "/health":
 		handleHealth(ctx)
 	case "/stats":
@@ -142,7 +152,7 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	}
 }
 
-func handleTurbo(ctx *fasthttp.RequestCtx) {
+func handleQuery(ctx *fasthttp.RequestCtx) {
 	ctx.SetContentTypeBytes(contentTypeJSON)
 
 	if !ctx.IsPost() {
@@ -158,6 +168,41 @@ func handleTurbo(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		writeError(ctx, "invalid JSON: "+err.Error())
+		return
+	}
+
+	if q, ok := raw["query"].(string); ok && q != "" {
+		handleQueryString(ctx, q)
+		return
+	}
+
+	if _, ok := raw["table"]; ok {
+		handleBatchInsert(ctx, body)
+		return
+	}
+
+	ctx.SetStatusCode(fasthttp.StatusBadRequest)
+	writeError(ctx, "request must contain 'query' or 'table' field")
+}
+
+func handleQueryString(ctx *fasthttp.RequestCtx, queryStr string) {
+	result, err := db.Execute(queryStr)
+	if err != nil {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
+		writeError(ctx, err.Error())
+		return
+	}
+
+	resp := Response{Success: true, Data: result}
+	data, _ := json.Marshal(resp)
+	ctx.SetBody(data)
+}
+
+func handleBatchInsert(ctx *fasthttp.RequestCtx, body []byte) {
 	var req BatchRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)

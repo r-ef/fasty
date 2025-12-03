@@ -10,36 +10,34 @@ import (
 type AsyncWriter struct {
 	db *RelationalDB
 
-	buffer     [][2][]byte
-	bufferMu   sync.Mutex
-	bufferSize int
+	buffer   [][2][]byte
+	bufferMu sync.Mutex
 
-	flushChan   chan [][2][]byte
-	doneChan    chan struct{}
-	flushWg     sync.WaitGroup
-	flushTicker *time.Ticker
+	flushChan     chan [][2][]byte
+	doneChan      chan struct{}
+	flushWg       sync.WaitGroup
+	flushTicker   *time.Ticker
 	persistTicker *time.Ticker
 
-	pending   uint64
-	flushed   uint64
-	batchSize int
+	pending uint64
+	flushed uint64
 
-	maxBatchSize   int
-	flushInterval  time.Duration
+	maxBatchSize    int
+	flushInterval   time.Duration
 	persistInterval time.Duration
-	numFlushers    int
+	numFlushers     int
 }
 
 func NewAsyncWriter(db *RelationalDB) *AsyncWriter {
 	aw := &AsyncWriter{
-		db:             db,
-		buffer:         make([][2][]byte, 0, 50000),
-		flushChan:      make(chan [][2][]byte, 100),
-		doneChan:       make(chan struct{}),
-		maxBatchSize:   10000,
-		flushInterval:  50 * time.Millisecond,
-		persistInterval: 5 * time.Second,
-		numFlushers:    4,
+		db:              db,
+		buffer:          make([][2][]byte, 0, 500000),
+		flushChan:       make(chan [][2][]byte, 10000),
+		doneChan:        make(chan struct{}),
+		maxBatchSize:    50000,
+		flushInterval:   25 * time.Millisecond,
+		persistInterval: 10 * time.Second,
+		numFlushers:     8,
 	}
 
 	for i := 0; i < aw.numFlushers; i++ {
@@ -215,7 +213,7 @@ func (db *RelationalDB) NewHighSpeedInserter(tableName string) (*HighSpeedInsert
 		schema:      schema,
 		asyncWriter: NewAsyncWriter(db),
 		encoders: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return &encoderBuffer{
 					keyBuf: make([]byte, 12),
 					valBuf: make([]byte, 0, 4096),
@@ -312,4 +310,3 @@ func (hsi *HighSpeedInserter) Close() uint64 {
 func (hsi *HighSpeedInserter) Count() uint64 {
 	return atomic.LoadUint64(&hsi.inserted)
 }
-

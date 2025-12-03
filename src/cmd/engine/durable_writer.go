@@ -25,6 +25,11 @@ type DurableWriter struct {
 	flushInterval time.Duration
 	flushTicker   *time.Ticker
 	numFlushers   int
+
+	rateLimit int64
+	rateStart time.Time
+	rateBytes int64
+	rateMu    sync.Mutex
 }
 
 func NewDurableWriter(db *RelationalDB, walDir string) (*DurableWriter, error) {
@@ -36,12 +41,14 @@ func NewDurableWriter(db *RelationalDB, walDir string) (*DurableWriter, error) {
 	dw := &DurableWriter{
 		db:            db,
 		wal:           wal,
-		buffer:        make([][2][]byte, 0, 50000),
-		flushChan:     make(chan [][2][]byte, 100),
+		buffer:        make([][2][]byte, 0, 200000),
+		flushChan:     make(chan [][2][]byte, 1000),
 		doneChan:      make(chan struct{}),
-		maxBatchSize:  10000,
-		flushInterval: 100 * time.Millisecond,
-		numFlushers:   4,
+		maxBatchSize:  50000,
+		flushInterval: 50 * time.Millisecond,
+		numFlushers:   8,
+		rateLimit:     200 * 1024 * 1024,
+		rateStart:     time.Now(),
 	}
 
 	if err := dw.recoverFromWAL(); err != nil {
@@ -58,6 +65,35 @@ func NewDurableWriter(db *RelationalDB, walDir string) (*DurableWriter, error) {
 	go dw.timerFlusher()
 
 	return dw, nil
+}
+
+func (dw *DurableWriter) throttle(n int) {
+	if dw.rateLimit <= 0 {
+		return
+	}
+
+	dw.rateMu.Lock()
+	defer dw.rateMu.Unlock()
+
+	dw.rateBytes += int64(n)
+	elapsed := time.Since(dw.rateStart)
+
+	if elapsed < 100*time.Millisecond {
+		return
+	}
+
+	expectedDuration := time.Duration((float64(dw.rateBytes) / float64(dw.rateLimit)) * float64(time.Second))
+	if elapsed < expectedDuration {
+		sleepTime := expectedDuration - elapsed
+		if sleepTime > 10*time.Millisecond {
+			time.Sleep(sleepTime)
+		}
+	}
+
+	if elapsed > 1*time.Second {
+		dw.rateStart = time.Now()
+		dw.rateBytes = 0
+	}
 }
 
 func (dw *DurableWriter) recoverFromWAL() error {
@@ -114,6 +150,8 @@ func (dw *DurableWriter) timerFlusher() {
 }
 
 func (dw *DurableWriter) Write(key, value []byte) error {
+	dw.throttle(len(key) + len(value))
+
 	if err := dw.wal.Write(key, value); err != nil {
 		return err
 	}
@@ -137,6 +175,12 @@ func (dw *DurableWriter) Write(key, value []byte) error {
 }
 
 func (dw *DurableWriter) WriteBatch(kvs [][2][]byte) error {
+	totalSize := 0
+	for _, kv := range kvs {
+		totalSize += len(kv[0]) + len(kv[1])
+	}
+	dw.throttle(totalSize)
+
 	if err := dw.wal.WriteBatch(kvs); err != nil {
 		return err
 	}
@@ -208,10 +252,10 @@ func (dw *DurableWriter) Close() error {
 }
 
 type DurableInserter struct {
-	db           *RelationalDB
-	schema       *TableSchema
-	durWriter    *DurableWriter
-	inserted     uint64
+	db        *RelationalDB
+	schema    *TableSchema
+	durWriter *DurableWriter
+	inserted  uint64
 }
 
 func (db *RelationalDB) NewDurableInserter(tableName string, walDir string) (*DurableInserter, error) {
@@ -285,4 +329,3 @@ func (di *DurableInserter) Close() error {
 func (di *DurableInserter) Stats() (inserted, pending uint64) {
 	return atomic.LoadUint64(&di.inserted), atomic.LoadUint64(&di.durWriter.pending)
 }
-

@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sync"
 	"unsafe"
 
 	json "github.com/goccy/go-json"
@@ -27,60 +26,41 @@ var (
 	falseBytes = []byte{byte(TypeBool), 0}
 )
 
-var (
-	smallBufPool = sync.Pool{
-		New: func() interface{} {
-			buf := make([]byte, 0, 128)
-			return &buf
-		},
-	}
-	mediumBufPool = sync.Pool{
-		New: func() interface{} {
-			buf := make([]byte, 0, 1024)
-			return &buf
-		},
-	}
-	largeBufPool = sync.Pool{
-		New: func() interface{} {
-			buf := make([]byte, 0, 8192)
-			return &buf
-		},
-	}
-)
-
-func getSmallBuf() *[]byte {
-	return smallBufPool.Get().(*[]byte)
-}
-
-func putSmallBuf(buf *[]byte) {
-	*buf = (*buf)[:0]
-	smallBufPool.Put(buf)
-}
-
-func getMediumBuf() *[]byte {
-	return mediumBufPool.Get().(*[]byte)
-}
-
-func putMediumBuf(buf *[]byte) {
-	*buf = (*buf)[:0]
-	mediumBufPool.Put(buf)
-}
-
 type TableSchema struct {
-	ID      uint32   `json:"id"`
-	Name    string   `json:"name"`
-	Columns []string `json:"columns"`
+	ID            uint32            `json:"id"`
+	Name          string            `json:"name"`
+	Columns       []string          `json:"columns"`
+	Types         []string          `json:"types"`
+	PrimaryKey    string            `json:"primary_key,omitempty"`
+	AutoIncrement bool              `json:"auto_increment,omitempty"`
+	ForeignKeys   map[string]FKRef  `json:"foreign_keys,omitempty"`
+	Constraints   ColumnConstraints `json:"constraints,omitempty"`
 
 	colIndex map[string]int
 }
 
-func (s *TableSchema) GetColumnIndex(name string) int {
-	if s.colIndex == nil {
-		s.colIndex = make(map[string]int, len(s.Columns))
-		for i, col := range s.Columns {
-			s.colIndex[col] = i
-		}
+type FKRef struct {
+	Table  string `json:"table"`
+	Column string `json:"column"`
+}
+
+type ColumnConstraints struct {
+	NotNull  map[string]bool        `json:"not_null,omitempty"`
+	Unique   map[string]bool        `json:"unique,omitempty"`
+	Defaults map[string]interface{} `json:"defaults,omitempty"`
+	Enums    map[string][]string    `json:"enums,omitempty"`
+	Checks   map[string]string      `json:"checks,omitempty"`
+	Lengths  map[string]int         `json:"lengths,omitempty"`
+}
+
+func (s *TableSchema) InitColumnIndex() {
+	s.colIndex = make(map[string]int, len(s.Columns))
+	for i, col := range s.Columns {
+		s.colIndex[col] = i
 	}
+}
+
+func (s *TableSchema) GetColumnIndex(name string) int {
 	if idx, ok := s.colIndex[name]; ok {
 		return idx
 	}

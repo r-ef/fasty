@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	numShards    = 256 
+	numShards    = 256
 	shardMask    = numShards - 1
 	initialSize  = 1024
 )
@@ -104,7 +104,7 @@ func (m *MemStore) Delete(key []byte) error {
 	k := string(key)
 	if v, exists := shard.data[k]; exists {
 		delete(shard.data, k)
-		atomic.AddUint64(&m.count, ^uint64(0)) 
+		atomic.AddUint64(&m.count, ^uint64(0))
 		atomic.AddUint64(&m.size, ^uint64(len(k)+len(v)-1))
 	}
 

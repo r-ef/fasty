@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -19,9 +20,9 @@ func (h TopKHeap) Len() int { return len(h.rows) }
 func (h TopKHeap) Less(i, j int) bool {
 	cmp := compareInterface(h.rows[i].Data[h.colIdx], h.rows[j].Data[h.colIdx])
 	if h.desc {
-		return cmp < 0 
+		return cmp < 0
 	}
-	return cmp > 0 
+	return cmp > 0
 }
 
 func (h TopKHeap) Swap(i, j int) { h.rows[i], h.rows[j] = h.rows[j], h.rows[i] }
@@ -126,13 +127,7 @@ func (db *RelationalDB) compileWhere(schema *TableSchema, where *WhereClause) []
 	return conditions
 }
 
-func (cc *CompiledCondition) Match(data []interface{}) bool {
-	if cc.colIdx >= len(data) {
-		return false
-	}
-
-	val := data[cc.colIdx]
-
+func (cc *CompiledCondition) MatchValue(val interface{}) bool {
 	if cc.isLike {
 		if s, ok := val.(string); ok {
 			return matchLike(s, cc.pattern)
@@ -233,6 +228,13 @@ func (cc *CompiledCondition) Match(data []interface{}) bool {
 	return false
 }
 
+func (cc *CompiledCondition) Match(data []interface{}) bool {
+	if cc.colIdx >= len(data) {
+		return false
+	}
+	return cc.MatchValue(data[cc.colIdx])
+}
+
 func matchConditions(matchers []*CompiledCondition, data []interface{}) bool {
 	if len(matchers) == 0 {
 		return true
@@ -245,7 +247,26 @@ func matchConditions(matchers []*CompiledCondition, data []interface{}) bool {
 	return false
 }
 
-func (db *RelationalDB) fastQueryWithHeap(iter interface{ Current() ([]byte, []byte, error); Next() error }, schema *TableSchema, matchers []*CompiledCondition, where *WhereClause, orderBy *OrderClause, limit int, offset *int) ([]Row, error) {
+func (db *RelationalDB) matchesFilterRaw(data []byte, matchers []*CompiledCondition) bool {
+	if len(matchers) == 0 {
+		return true
+	}
+	for _, m := range matchers {
+		val, err := db.encoder.DecodeValueFast(data, m.colIdx)
+		if err != nil {
+			return false
+		}
+		if !m.MatchValue(val) {
+			return false
+		}
+	}
+	return true
+}
+
+func (db *RelationalDB) fastQueryWithHeap(iter interface {
+	Current() ([]byte, []byte, error)
+	Next() error
+}, schema *TableSchema, matchers []*CompiledCondition, where *WhereClause, orderBy *OrderClause, limit int, offset *int) ([]Row, error) {
 	colIdx := schema.GetColumnIndex(orderBy.Column)
 	if colIdx == -1 {
 		colIdx = 0
@@ -259,7 +280,7 @@ func (db *RelationalDB) fastQueryWithHeap(iter interface{ Current() ([]byte, []b
 	h := &TopKHeap{
 		rows:   make([]Row, 0, need+1),
 		colIdx: colIdx,
-		desc:   orderBy.Desc,
+		desc:   strings.EqualFold(orderBy.Direction, "DESC"),
 		k:      need,
 	}
 	heap.Init(h)
@@ -322,7 +343,10 @@ func (db *RelationalDB) matchesFilterFast(schema *TableSchema, data []interface{
 	return db.matchesFilter(schema, row, where)
 }
 
-func (db *RelationalDB) fastParallelScan(iter interface{ Current() ([]byte, []byte, error); Next() error }, schema *TableSchema, matchers []*CompiledCondition, where *WhereClause, limit *int, offset *int) ([]Row, error) {
+func (db *RelationalDB) fastParallelScan(iter interface {
+	Current() ([]byte, []byte, error)
+	Next() error
+}, schema *TableSchema, matchers []*CompiledCondition, where *WhereClause, limit *int, offset *int) ([]Row, error) {
 	type kvPair struct {
 		key []byte
 		val []byte
@@ -352,12 +376,16 @@ func (db *RelationalDB) fastParallelScan(iter interface{ Current() ([]byte, []by
 	if len(pairs) < 500 {
 		rows := make([]Row, 0, len(pairs))
 		for _, p := range pairs {
+			if matchers != nil && !db.matchesFilterRaw(p.val, matchers) {
+				continue
+			}
+
 			decoded, err := db.encoder.DecodeValue(p.val)
 			if err != nil {
 				continue
 			}
 
-			if where != nil && !db.matchesFilterFast(schema, decoded, where, matchers) {
+			if where != nil && matchers == nil && !db.matchesFilter(schema, Row{Data: decoded}, where) {
 				continue
 			}
 
@@ -405,12 +433,16 @@ func (db *RelationalDB) fastParallelScan(iter interface{ Current() ([]byte, []by
 
 			for i := start; i < end; i++ {
 				p := pairs[i]
+				if matchers != nil && !db.matchesFilterRaw(p.val, matchers) {
+					continue
+				}
+
 				decoded, err := db.encoder.DecodeValue(p.val)
 				if err != nil {
 					continue
 				}
 
-				if where != nil && !db.matchesFilterFast(schema, decoded, where, matchers) {
+				if where != nil && matchers == nil && !db.matchesFilter(schema, Row{Data: decoded}, where) {
 					continue
 				}
 
@@ -446,4 +478,3 @@ func (db *RelationalDB) fastParallelScan(iter interface{ Current() ([]byte, []by
 
 	return rows, nil
 }
-

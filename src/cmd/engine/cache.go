@@ -1,22 +1,24 @@
 package engine
 
 import (
+	"container/list"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 )
 
 type ResultCache struct {
-	mu       sync.RWMutex
-	cache    map[uint64]*cacheEntry
-	maxSize  int
-	hits     uint64
-	misses   uint64
-	enabled  bool
+	mu      sync.Mutex
+	cache   map[uint64]*list.Element
+	lruList *list.List
+	maxSize int
+	hits    uint64
+	misses  uint64
+	enabled bool
 }
 
 type cacheEntry struct {
+	key       uint64
 	result    string
 	timestamp int64
 	hits      uint32
@@ -24,7 +26,8 @@ type cacheEntry struct {
 
 func NewResultCache(maxSize int) *ResultCache {
 	return &ResultCache{
-		cache:   make(map[uint64]*cacheEntry, maxSize),
+		cache:   make(map[uint64]*list.Element, maxSize),
+		lruList: list.New(),
 		maxSize: maxSize,
 		enabled: true,
 	}
@@ -46,11 +49,12 @@ func (c *ResultCache) Get(query string) (string, bool) {
 
 	hash := hashQuery(query)
 
-	c.mu.RLock()
-	entry, ok := c.cache[hash]
-	c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	if ok {
+	if elem, ok := c.cache[hash]; ok {
+		c.lruList.MoveToFront(elem)
+		entry := elem.Value.(*cacheEntry)
 		atomic.AddUint64(&c.hits, 1)
 		atomic.AddUint32(&entry.hits, 1)
 		return entry.result, true
@@ -74,37 +78,42 @@ func (c *ResultCache) Set(query, result string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.cache) >= c.maxSize {
+	if elem, ok := c.cache[hash]; ok {
+		c.lruList.MoveToFront(elem)
+		entry := elem.Value.(*cacheEntry)
+		entry.result = result
+		entry.timestamp = time.Now().UnixNano()
+		return
+	}
+
+	if c.lruList.Len() >= c.maxSize {
 		c.evictLRU()
 	}
 
-	c.cache[hash] = &cacheEntry{
+	entry := &cacheEntry{
+		key:       hash,
 		result:    result,
 		timestamp: time.Now().UnixNano(),
 		hits:      1,
 	}
+	elem := c.lruList.PushFront(entry)
+	c.cache[hash] = elem
 }
 
 func (c *ResultCache) evictLRU() {
-	var oldestKey uint64
-	var oldestTime int64 = 1<<63 - 1
-	var lowestHits uint32 = 1<<32 - 1
-
-	for k, v := range c.cache {
-		if v.hits < lowestHits || (v.hits == lowestHits && v.timestamp < oldestTime) {
-			oldestKey = k
-			oldestTime = v.timestamp
-			lowestHits = v.hits
-		}
+	elem := c.lruList.Back()
+	if elem != nil {
+		c.lruList.Remove(elem)
+		entry := elem.Value.(*cacheEntry)
+		delete(c.cache, entry.key)
 	}
-
-	delete(c.cache, oldestKey)
 }
 
 func (c *ResultCache) Invalidate() {
 	c.mu.Lock()
-	c.cache = make(map[uint64]*cacheEntry, c.maxSize)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	c.lruList.Init()
+	c.cache = make(map[uint64]*list.Element, c.maxSize)
 }
 
 func (c *ResultCache) Stats() (hits, misses uint64) {
@@ -137,88 +146,6 @@ func (a *Arena) Reset() {
 	a.off = 0
 }
 
-func fastStringEqual(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	if len(a) == 0 {
-		return true
-	}
-	return *(*string)(unsafe.Pointer(&a)) == *(*string)(unsafe.Pointer(&b))
-}
-
-func fastHasPrefix(s, prefix string) bool {
-	if len(s) < len(prefix) {
-		return false
-	}
-	return s[:len(prefix)] == prefix
-}
-
-var rowPools = [...]sync.Pool{
-	{New: func() interface{} { r := make([]Row, 0, 16); return &r }},
-	{New: func() interface{} { r := make([]Row, 0, 64); return &r }},
-	{New: func() interface{} { r := make([]Row, 0, 256); return &r }},
-	{New: func() interface{} { r := make([]Row, 0, 1024); return &r }},
-}
-
-func getRowSliceFromPool(hint int) *[]Row {
-	idx := 0
-	if hint > 16 {
-		idx = 1
-	}
-	if hint > 64 {
-		idx = 2
-	}
-	if hint > 256 {
-		idx = 3
-	}
-	s := rowPools[idx].Get().(*[]Row)
-	*s = (*s)[:0]
-	return s
-}
-
-func putRowSliceToPool(s *[]Row, cap int) {
-	if cap <= 16 {
-		rowPools[0].Put(s)
-	} else if cap <= 64 {
-		rowPools[1].Put(s)
-	} else if cap <= 256 {
-		rowPools[2].Put(s)
-	} else if cap <= 1024 {
-		rowPools[3].Put(s)
-	}
-}
-
-var bytePools = [...]sync.Pool{
-	{New: func() interface{} { b := make([]byte, 0, 128); return &b }},
-	{New: func() interface{} { b := make([]byte, 0, 1024); return &b }},
-	{New: func() interface{} { b := make([]byte, 0, 8192); return &b }},
-}
-
-func getByteSlice(hint int) *[]byte {
-	idx := 0
-	if hint > 128 {
-		idx = 1
-	}
-	if hint > 1024 {
-		idx = 2
-	}
-	b := bytePools[idx].Get().(*[]byte)
-	*b = (*b)[:0]
-	return b
-}
-
-func putByteSlice(b *[]byte) {
-	cap := cap(*b)
-	if cap <= 128 {
-		bytePools[0].Put(b)
-	} else if cap <= 1024 {
-		bytePools[1].Put(b)
-	} else if cap <= 8192 {
-		bytePools[2].Put(b)
-	}
-}
-
 type ConditionMatcher struct {
 	colIdx int
 	op     uint8
@@ -235,45 +162,6 @@ const (
 	opGe
 	opLe
 )
-
-func compileCondition(schema *TableSchema, cond *Condition) *ConditionMatcher {
-	colIdx := schema.GetColumnIndex(cond.Column)
-	if colIdx == -1 {
-		return nil
-	}
-
-	m := &ConditionMatcher{colIdx: colIdx}
-
-	switch cond.Op {
-	case "=":
-		m.op = opEq
-	case "!=":
-		m.op = opNe
-	case ">":
-		m.op = opGt
-	case "<":
-		m.op = opLt
-	case ">=":
-		m.op = opGe
-	case "<=":
-		m.op = opLe
-	default:
-		return nil
-	}
-
-	val := cond.Value.ToInterface()
-	switch v := val.(type) {
-	case int:
-		m.isInt = true
-		m.intVal = int64(v)
-	case string:
-		m.strVal = v
-	default:
-		return nil
-	}
-
-	return m
-}
 
 func (m *ConditionMatcher) Match(data []interface{}) bool {
 	if m.colIdx >= len(data) {
@@ -333,4 +221,3 @@ func (m *ConditionMatcher) Match(data []interface{}) bool {
 
 	return false
 }
-

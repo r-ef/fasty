@@ -1,7 +1,7 @@
 package memstore
 
 import (
-	"github.com/couchbase/moss"
+	"github.com/r-ef/moss"
 )
 
 type Wrapper struct {
@@ -103,4 +103,3 @@ func (m *MossIteratorAdapter) Seek(key []byte) error {
 func (m *MossIteratorAdapter) SeekTo(key []byte) error {
 	return m.Seek(key)
 }
-

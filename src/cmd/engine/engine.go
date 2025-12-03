@@ -16,7 +16,10 @@ import (
 
 	json "github.com/goccy/go-json"
 
+	"regexp"
+
 	"github.com/alecthomas/participle/v2"
+	"github.com/alecthomas/participle/v2/lexer"
 	"github.com/bits-and-blooms/bloom/v3"
 
 	tree "github.com/r-ef/fasty/src/LSMTree"
@@ -67,55 +70,85 @@ func (c *queryCache) set(q string, ast *Query) {
 	c.cache[q] = ast
 }
 
-var (
-	rowSlicePool = sync.Pool{
-		New: func() interface{} {
-			s := make([]Row, 0, 128)
-			return &s
-		},
-	}
-	bufferPool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, 0, 4096)
-		},
-	}
-)
-
 type Query struct {
-	Create      *CreateCmd      `parser:"@@"`
-	CreateIndex *CreateIndexCmd `parser:"| @@"`
-	Insert      *InsertCmd      `parser:"| @@"`
-	Select      *SelectCmd      `parser:"| @@"`
-	Find        *FindCmd        `parser:"| @@"`
-	Update      *UpdateCmd      `parser:"| @@"`
-	Delete      *DeleteCmd      `parser:"| @@"`
-	Drop        *DropCmd        `parser:"| @@"`
-	DropIndex   *DropIndexCmd   `parser:"| @@"`
+	Cmd *Command `parser:"@@? ';'?"`
+}
+
+type Command struct {
+	Create *CreateStmt `parser:"(@@ |"`
+	Insert *InsertCmd  `parser:" @@ |"`
+	Select *SelectCmd  `parser:" @@ |"`
+	Update *UpdateCmd  `parser:" @@ |"`
+	Delete *DeleteCmd  `parser:" @@ |"`
+	Drop   *DropStmt   `parser:" @@)"`
+}
+
+type CreateStmt struct {
+	Table *CreateCmd      `parser:"'CREATE' ('TABLE' @@"`
+	Index *CreateIndexCmd `parser:"| 'INDEX' @@)"`
+}
+
+type DropStmt struct {
+	Table *DropCmd      `parser:"'DROP' ('TABLE' @@"`
+	Index *DropIndexCmd `parser:"| 'INDEX' @@)"`
 }
 
 type CreateCmd struct {
-	Name string   `parser:"'create' 'table' @Ident"`
-	Cols []ColDef `parser:"'{' @@ (',' @@)* '}'"`
+	Name     string         `parser:"@Ident"`
+	Elements []TableElement `parser:"('(' @@ (',' @@)* ')') | ('{' @@ (',' @@)* '}')"`
+}
+
+type TableElement struct {
+	Constraint *Constraint `parser:"'CONSTRAINT' @@"`
+	Column     *ColDef     `parser:"| @@"`
+}
+
+type Constraint struct {
+	Name  string     `parser:"@Ident"`
+	Check *CheckExpr `parser:"'CHECK' '(' @@ ')'"`
+}
+
+type CheckExpr struct {
+	Left   string   `parser:"@Ident"`
+	Op     string   `parser:"@('LIKE' | 'IN' | '=' | '!=' | '>' | '<' | '>=' | '<=')"`
+	Right  *Value   `parser:"@@?"`
+	InList []*Value `parser:"('(' @@ (',' @@)* ')')?"`
 }
 
 type ColDef struct {
-	Name string `parser:"@Ident ':'"`
-	Type string `parser:"@Ident"`
+	Name          string      `parser:"@Ident ':'?"`
+	Type          string      `parser:"@Ident"`
+	TypeParams    []string    `parser:"('(' (@String | @Ident | @Int) (',' (@String | @Ident | @Int))* ')')?"`
+	PrimaryKey    bool        `parser:"@('PRIMARY' 'KEY')?"`
+	AutoIncrement bool        `parser:"@('AUTO_INCREMENT')?"`
+	NotNull       bool        `parser:"@('NOT' 'NULL')?"`
+	Unique        bool        `parser:"@('UNIQUE')?"`
+	Default       *Value      `parser:"('DEFAULT' @@)?"`
+	ForeignKey    *ForeignKey `parser:"@@?"`
+	Check         *CheckExpr  `parser:"('CHECK' '(' @@ ')')?"`
+}
+
+type ForeignKey struct {
+	Table    string `parser:"'REFERENCES' @Ident"`
+	Column   string `parser:"'(' @Ident ')'"`
+	OnDelete string `parser:"('ON' 'DELETE' @('CASCADE' | 'SET' 'NULL' | 'RESTRICT' | 'NO' 'ACTION'))?"`
+	OnUpdate string `parser:"('ON' 'UPDATE' @('CASCADE' | 'SET' 'NULL' | 'RESTRICT' | 'NO' 'ACTION'))?"`
 }
 
 type CreateIndexCmd struct {
-	Name   string `parser:"'create' 'index' @Ident"`
-	Table  string `parser:"'on' @Ident"`
+	Name   string `parser:"@Ident"`
+	Table  string `parser:"'ON' @Ident"`
 	Column string `parser:"'(' @Ident ')'"`
 }
 
 type DropIndexCmd struct {
-	Name string `parser:"'drop' 'index' @Ident"`
+	Name string `parser:"@Ident"`
 }
 
 type InsertCmd struct {
-	Table string `parser:"'insert' @Ident"`
-	Pairs []KV   `parser:"'{' @@ (',' @@)* '}'"`
+	Table   string   `parser:"'INSERT' 'INTO' @Ident"`
+	Columns []string `parser:"'(' @Ident (',' @Ident)* ')'"`
+	Values  []*Value `parser:"'VALUES' '(' @@ (',' @@)* ')'"`
 }
 
 type KV struct {
@@ -124,13 +157,14 @@ type KV struct {
 }
 
 type Value struct {
-	Null   bool     `parser:"  @'null'"`
-	Bool   *bool    `parser:"| @('true' | 'false')"`
-	Float  *float64 `parser:"| @Float"`
-	Number *int     `parser:"| @Int"`
-	String *string  `parser:"| @String"`
-	Object []KV     `parser:"| '{' (@@ (',' @@)*)? '}'"`
-	Array  []*Value `parser:"| '[' (@@ (',' @@)*)? ']'"`
+	Null       bool     `parser:"  @'NULL'"`
+	Bool       *bool    `parser:"| @('TRUE' | 'FALSE')"`
+	Float      *float64 `parser:"| @Float"`
+	Number     *int     `parser:"| @Int"`
+	String     *string  `parser:"| @String"`
+	Identifier *string  `parser:"| @Ident"`
+	Object     []KV     `parser:"| '{' (@@ (',' @@)*)? '}'"`
+	Array      []*Value `parser:"| '[' (@@ (',' @@)*)? ']'"`
 }
 
 func (v *Value) ToInterface() interface{} {
@@ -148,6 +182,9 @@ func (v *Value) ToInterface() interface{} {
 	}
 	if v.String != nil {
 		return *v.String
+	}
+	if v.Identifier != nil {
+		return *v.Identifier
 	}
 	if v.Object != nil {
 		obj := make(map[string]interface{}, len(v.Object))
@@ -167,53 +204,97 @@ func (v *Value) ToInterface() interface{} {
 }
 
 type SelectCmd struct {
-	Columns []string     `parser:"'select' (@Ident (',' @Ident)* | '*')"`
-	Table   string       `parser:"'from' @Ident"`
-	Where   *WhereClause `parser:"@@?"`
-	OrderBy *OrderClause `parser:"@@?"`
-	Limit   *int         `parser:"('limit' @Int)?"`
-	Offset  *int         `parser:"('offset' @Int)?"`
+	Selectors []Selector   `parser:"'SELECT' @@ (',' @@)*"`
+	Table     *string      `parser:"('FROM' @Ident)?"`
+	Joins     []*Join      `parser:"@@*"`
+	Where     *WhereClause `parser:"@@?"`
+	GroupBy   *GroupBy     `parser:"@@?"`
+	OrderBy   *OrderClause `parser:"@@?"`
+	Limit     *int         `parser:"('LIMIT' @Int)?"`
+	Offset    *int         `parser:"('OFFSET' @Int)?"`
+}
+
+type Join struct {
+	Type  string `parser:"@('INNER' | 'LEFT' | 'RIGHT' | 'FULL' | 'CROSS')? 'JOIN'"`
+	Table string `parser:"@Ident"`
+	On    *On    `parser:"'ON' @@"`
+}
+
+type On struct {
+	Left  string `parser:"@Ident"`
+	Op    string `parser:"@('=' | '!=' | '>' | '<' | '>=' | '<=')"`
+	Right string `parser:"@Ident"`
+}
+
+type GroupBy struct {
+	Columns []string `parser:"'GROUP' 'BY' @Ident (',' @Ident)*"`
+}
+
+type Selector struct {
+	Star     bool            `parser:"@'*'"`
+	Function *FuncWithAlias  `parser:"| @@"`
+	Value    *ValueWithAlias `parser:"| @@"`
+}
+
+type FuncWithAlias struct {
+	Func  *Func  `parser:"@@"`
+	Alias string `parser:"( 'AS' @Ident )?"`
+}
+
+type ValueWithAlias struct {
+	Value *Value `parser:"@@"`
+	Alias string `parser:"( 'AS' @Ident )?"`
+}
+
+type Func struct {
+	Name string `parser:"@Ident"`
+	Arg  string `parser:"'(' @Ident ')'"`
 }
 
 type OrderClause struct {
-	Column string `parser:"'order' 'by' @Ident"`
-	Desc   bool   `parser:"@'desc'?"`
+	Column    string `parser:"'ORDER' 'BY' @Ident"`
+	Direction string `parser:"@('DESC' | 'ASC')?"`
 }
 
 type FindCmd struct {
-	Table   string       `parser:"'find' @Ident"`
+	Table   string       `parser:"'FIND' @Ident"`
 	Where   *WhereClause `parser:"@@?"`
 	OrderBy *OrderClause `parser:"@@?"`
-	Limit   *int         `parser:"('limit' @Int)?"`
+	Limit   *int         `parser:"('LIMIT' @Int)?"`
 }
 
 type WhereClause struct {
-	Or []*AndClause `parser:"'where' @@ ('or' @@)*"`
+	Or []*AndClause `parser:"'WHERE' @@ ('OR' @@)*"`
 }
 
 type AndClause struct {
-	Conditions []Condition `parser:"@@ ('and' @@)*"`
+	Conditions []Condition `parser:"@@ ('AND' @@)*"`
 }
 
 type Condition struct {
 	Column string `parser:"@Ident"`
-	Op     string `parser:"@('=' | '!=' | '>' | '<' | '>=' | '<=' | 'like')"`
+	Op     string `parser:"@('=' | '!=' | '>' | '<' | '>=' | '<=' | 'LIKE')"`
 	Value  *Value `parser:"@@"`
 }
 
 type UpdateCmd struct {
-	Table string       `parser:"'update' @Ident"`
-	Set   []KV         `parser:"'set' '{' @@ (',' @@)* '}'"`
-	Where *WhereClause `parser:"@@?"`
+	Table       string       `parser:"'UPDATE' @Ident"`
+	Assignments []Assignment `parser:"'SET' @@ (',' @@)*"`
+	Where       *WhereClause `parser:"@@?"`
+}
+
+type Assignment struct {
+	Column string `parser:"@Ident '='"`
+	Value  *Value `parser:"@@"`
 }
 
 type DeleteCmd struct {
-	Table string       `parser:"'delete' @Ident"`
+	Table string       `parser:"'DELETE' 'FROM' @Ident"`
 	Where *WhereClause `parser:"@@?"`
 }
 
 type DropCmd struct {
-	Table string `parser:"'drop' 'table' @Ident"`
+	Table string `parser:"@Ident"`
 }
 
 type IndexSchema struct {
@@ -250,13 +331,31 @@ type RelationalDB struct {
 	cacheHits  uint64
 }
 
+var (
+	sqlLexer = lexer.MustSimple([]lexer.SimpleRule{
+		{Name: "Comment", Pattern: `--[^\n]*`},
+		{Name: "String", Pattern: `'[^']*'|"[^"]*"`},
+		{Name: "Float", Pattern: `[-+]?\d+\.\d+`},
+		{Name: "Int", Pattern: `[-+]?\d+`},
+		{Name: "Operators", Pattern: `>=|<=|!=|<>`},
+		{Name: "Punct", Pattern: `[-!()+/*,;=<>]`},
+		{Name: "Ident", Pattern: `[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?`},
+		{Name: "Whitespace", Pattern: `\s+`},
+	})
+)
+
 func NewRelationalDB(storagePath string) (*RelationalDB, error) {
 	kv, err := tree.Open(storagePath)
 	if err != nil {
 		return nil, err
 	}
 
-	parser, err := participle.Build[Query]()
+	parser, err := participle.Build[Query](
+		participle.Lexer(sqlLexer),
+		participle.CaseInsensitive("Ident"),
+		participle.Unquote("String"),
+		participle.Elide("Whitespace", "Comment"),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build parser: %w", err)
 	}
@@ -291,7 +390,12 @@ func NewInMemoryDB() (*RelationalDB, error) {
 		return nil, err
 	}
 
-	parser, err := participle.Build[Query]()
+	parser, err := participle.Build[Query](
+		participle.Lexer(sqlLexer),
+		participle.CaseInsensitive("Ident"),
+		participle.Unquote("String"),
+		participle.Elide("Whitespace", "Comment"),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build parser: %w", err)
 	}
@@ -321,6 +425,15 @@ func (db *RelationalDB) Close() error {
 func (db *RelationalDB) Execute(queryStr string) (string, error) {
 	atomic.AddUint64(&db.queryCount, 1)
 
+	lower := strings.ToLower(strings.TrimSpace(queryStr))
+	if lower == "show tables" {
+		return db.handleShowTables()
+	}
+	if strings.HasPrefix(lower, "describe ") {
+		tableName := strings.TrimSpace(queryStr[9:])
+		return db.handleDescribe(tableName)
+	}
+
 	ast, ok := db.queryCache.get(queryStr)
 	if ok {
 		atomic.AddUint64(&db.cacheHits, 1)
@@ -333,40 +446,270 @@ func (db *RelationalDB) Execute(queryStr string) (string, error) {
 		db.queryCache.set(queryStr, ast)
 	}
 
+	if ast.Cmd == nil {
+		return "", nil
+	}
+
+	cmd := ast.Cmd
 	switch {
-	case ast.Create != nil:
-		return db.handleCreate(ast.Create)
-	case ast.CreateIndex != nil:
-		return db.handleCreateIndex(ast.CreateIndex)
-	case ast.Insert != nil:
-		return db.handleInsert(ast.Insert) 
-	case ast.Select != nil:
-		return db.handleSelectCached(queryStr, ast.Select)
-	case ast.Find != nil:
-		return db.handleFindCached(queryStr, ast.Find)
-	case ast.Update != nil:
-		db.resultCache.Invalidate() 
-		return db.handleUpdate(ast.Update)
-	case ast.Delete != nil:
-		db.resultCache.Invalidate() 
-		return db.handleDelete(ast.Delete)
-	case ast.Drop != nil:
-		db.resultCache.Invalidate() 
-		return db.handleDrop(ast.Drop)
-	case ast.DropIndex != nil:
-		return db.handleDropIndex(ast.DropIndex)
+	case cmd.Create != nil:
+		if cmd.Create.Table != nil {
+			return db.handleCreate(cmd.Create.Table)
+		}
+		if cmd.Create.Index != nil {
+			return db.handleCreateIndex(cmd.Create.Index)
+		}
+	case cmd.Insert != nil:
+		return db.handleInsert(cmd.Insert)
+	case cmd.Select != nil:
+		return db.handleSelectCached(queryStr, cmd.Select)
+	case cmd.Update != nil:
+		db.resultCache.Invalidate()
+		return db.handleUpdate(cmd.Update)
+	case cmd.Delete != nil:
+		db.resultCache.Invalidate()
+		return db.handleDelete(cmd.Delete)
+	case cmd.Drop != nil:
+		if cmd.Drop.Table != nil {
+			db.resultCache.Invalidate()
+			return db.handleDrop(cmd.Drop.Table)
+		}
+		if cmd.Drop.Index != nil {
+			return db.handleDropIndex(cmd.Drop.Index)
+		}
 	}
 
 	return "", errors.New("empty query")
 }
 
-func (db *RelationalDB) handleCreate(cmd *CreateCmd) (string, error) {
-	colNames := make([]string, len(cmd.Cols))
-	for i, col := range cmd.Cols {
-		colNames[i] = col.Name
+func (db *RelationalDB) handleShowTables() (string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	tables := make([]map[string]interface{}, 0, len(db.catalog))
+	for name, schema := range db.catalog {
+		tables = append(tables, map[string]interface{}{
+			"name":    name,
+			"columns": len(schema.Columns),
+		})
 	}
 
-	if err := db.createTableInternal(cmd.Name, colNames); err != nil {
+	data, _ := json.Marshal(tables)
+	return string(data), nil
+}
+
+func (db *RelationalDB) handleDescribe(tableName string) (string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	schema, ok := db.catalog[tableName]
+	if !ok {
+		return "", fmt.Errorf("table '%s' not found", tableName)
+	}
+
+	types := schema.Types
+	if types == nil || len(types) == 0 {
+		types = make([]string, len(schema.Columns))
+		for i := range types {
+			types[i] = "any"
+		}
+	}
+
+	indexes := make([]string, 0)
+	for _, idx := range db.tableIndex[tableName] {
+		indexes = append(indexes, idx.Column)
+	}
+
+	result := map[string]interface{}{
+		"name":        tableName,
+		"columns":     schema.Columns,
+		"types":       types,
+		"indexes":     indexes,
+		"primary_key": schema.PrimaryKey,
+	}
+
+	if schema.AutoIncrement {
+		result["auto_increment"] = true
+	}
+
+	if len(schema.ForeignKeys) > 0 {
+		fks := make(map[string]string)
+		for col, ref := range schema.ForeignKeys {
+			fks[col] = ref.Table + "(" + ref.Column + ")"
+		}
+		result["foreign_keys"] = fks
+	}
+
+	if len(schema.Constraints.NotNull) > 0 {
+		result["not_null"] = schema.Constraints.NotNull
+	}
+
+	if len(schema.Constraints.Unique) > 0 {
+		result["unique"] = schema.Constraints.Unique
+	}
+
+	if len(schema.Constraints.Defaults) > 0 {
+		result["defaults"] = schema.Constraints.Defaults
+	}
+
+	if len(schema.Constraints.Enums) > 0 {
+		result["enums"] = schema.Constraints.Enums
+	}
+
+	if len(schema.Constraints.Checks) > 0 {
+		result["checks"] = schema.Constraints.Checks
+	}
+
+	data, _ := json.Marshal(result)
+	return string(data), nil
+}
+
+func (db *RelationalDB) handleCreate(cmd *CreateCmd) (string, error) {
+	var cols []ColDef
+	for _, el := range cmd.Elements {
+		if el.Column != nil {
+			cols = append(cols, *el.Column)
+		}
+	}
+
+	colNames := make([]string, len(cols))
+	colTypes := make([]string, len(cols))
+	var primaryKey string
+	var autoIncrement bool
+	foreignKeys := make(map[string]FKRef)
+	constraints := ColumnConstraints{
+		NotNull:  make(map[string]bool),
+		Unique:   make(map[string]bool),
+		Defaults: make(map[string]interface{}),
+		Enums:    make(map[string][]string),
+		Checks:   make(map[string]string),
+		Lengths:  make(map[string]int),
+	}
+
+	for i, col := range cols {
+		colNames[i] = col.Name
+		colType := col.Type
+
+		if strings.EqualFold(col.Type, "VARCHAR") || strings.EqualFold(col.Type, "CHAR") {
+			if len(col.TypeParams) > 0 {
+				if length, err := strconv.Atoi(col.TypeParams[0]); err == nil {
+					constraints.Lengths[col.Name] = length
+				}
+			}
+			colType = "string"
+		} else if strings.EqualFold(col.Type, "ENUM") {
+			if len(col.TypeParams) > 0 {
+				enumValues := make([]string, len(col.TypeParams))
+				for j, param := range col.TypeParams {
+					enumValues[j] = strings.Trim(param, `"'`)
+				}
+				constraints.Enums[col.Name] = enumValues
+			}
+			colType = "string"
+		} else if strings.EqualFold(col.Type, "TIMESTAMP") {
+			colType = "int"
+		} else if strings.EqualFold(col.Type, "BOOLEAN") {
+			colType = "bool"
+		} else if strings.EqualFold(col.Type, "INT") {
+			colType = "int"
+		}
+
+		colTypes[i] = strings.ToLower(colType)
+
+		if col.PrimaryKey {
+			if primaryKey != "" {
+				return "", fmt.Errorf("table can only have one primary key")
+			}
+			primaryKey = col.Name
+			autoIncrement = col.AutoIncrement
+		}
+
+		if col.NotNull {
+			constraints.NotNull[col.Name] = true
+		}
+
+		if col.Unique {
+			constraints.Unique[col.Name] = true
+		}
+
+		if col.Default != nil {
+			constraints.Defaults[col.Name] = col.Default.ToInterface()
+		} else if strings.EqualFold(col.Type, "TIMESTAMP") && primaryKey != col.Name {
+		}
+
+		if col.Default != nil {
+			constraints.Defaults[col.Name] = col.Default.ToInterface()
+		} else if strings.EqualFold(col.Type, "timestamp") && primaryKey != col.Name {
+			constraints.Defaults[col.Name] = time.Now().Unix()
+		}
+
+		if col.ForeignKey != nil {
+			foreignKeys[col.Name] = FKRef{
+				Table:  col.ForeignKey.Table,
+				Column: col.ForeignKey.Column,
+			}
+		}
+
+		if col.Check != nil {
+			checkExpr := col.Check
+			if checkExpr.InList != nil {
+				vals := make([]string, len(checkExpr.InList))
+				for i, v := range checkExpr.InList {
+					vals[i] = fmt.Sprintf("%v", v.ToInterface())
+					if s, ok := v.ToInterface().(string); ok {
+						vals[i] = fmt.Sprintf("'%s'", s)
+					}
+				}
+				checkBody := fmt.Sprintf("%s IN (%s)", checkExpr.Left, strings.Join(vals, ", "))
+				constraints.Checks[col.Name] = checkBody
+			} else {
+				rightVal := checkExpr.Right.ToInterface()
+				rightStr := fmt.Sprintf("%v", rightVal)
+				if s, ok := rightVal.(string); ok {
+					rightStr = fmt.Sprintf("'%s'", s)
+				}
+				checkBody := fmt.Sprintf("%s %s %s", checkExpr.Left, checkExpr.Op, rightStr)
+				constraints.Checks[col.Name] = checkBody
+			}
+		}
+	}
+
+	for _, el := range cmd.Elements {
+		if el.Constraint != nil {
+
+			checkExpr := el.Constraint.Check
+			if checkExpr == nil {
+				continue
+			}
+
+			var checkBody string
+			if checkExpr.InList != nil {
+				vals := make([]string, len(checkExpr.InList))
+				for i, v := range checkExpr.InList {
+					vals[i] = fmt.Sprintf("%v", v.ToInterface())
+					if s, ok := v.ToInterface().(string); ok {
+						vals[i] = fmt.Sprintf("'%s'", s)
+					}
+				}
+				checkBody = fmt.Sprintf("%s IN (%s)", checkExpr.Left, strings.Join(vals, ", "))
+			} else {
+				rightVal := checkExpr.Right.ToInterface()
+				rightStr := fmt.Sprintf("%v", rightVal)
+				if s, ok := rightVal.(string); ok {
+					rightStr = fmt.Sprintf("'%s'", s)
+				}
+				checkBody = fmt.Sprintf("%s %s %s", checkExpr.Left, checkExpr.Op, rightStr)
+			}
+
+			for _, colName := range colNames {
+				if strings.EqualFold(checkExpr.Left, colName) {
+					constraints.Checks[colName] = checkBody
+				}
+			}
+		}
+	}
+
+	if err := db.createTableFull(cmd.Name, colNames, colTypes, primaryKey, autoIncrement, foreignKeys, constraints); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("Table '%s' created", cmd.Name), nil
@@ -569,24 +912,90 @@ func (db *RelationalDB) handleInsert(cmd *InsertCmd) (string, error) {
 		return "", fmt.Errorf("table '%s' does not exist", cmd.Table)
 	}
 
+	if len(cmd.Columns) != len(cmd.Values) {
+		return "", fmt.Errorf("column count %d does not match value count %d", len(cmd.Columns), len(cmd.Values))
+	}
+
 	rowData := make([]interface{}, len(schema.Columns))
 	pk := uint64(0)
+	pkCol := schema.PrimaryKey
+	if pkCol == "" {
+		pkCol = "id"
+	}
 
-	for _, pair := range cmd.Pairs {
-		colIdx := schema.GetColumnIndex(pair.Key)
+	for i := range rowData {
+		colName := schema.Columns[i]
+		if def, ok := schema.Constraints.Defaults[colName]; ok {
+			if s, isStr := def.(string); isStr && s == "CURRENT_TIMESTAMP" {
+				rowData[i] = time.Now().Unix()
+			} else {
+				rowData[i] = def
+			}
+		}
+	}
+
+	for i, colName := range cmd.Columns {
+		colIdx := schema.GetColumnIndex(colName)
 		if colIdx == -1 {
-			return "", fmt.Errorf("unknown column: %s", pair.Key)
+			return "", fmt.Errorf("unknown column: %s", colName)
 		}
 
-		val := pair.Value.ToInterface()
+		val := cmd.Values[i].ToInterface()
+
+		if err := db.validateColumnValue(schema, colName, val); err != nil {
+			return "", err
+		}
+
 		rowData[colIdx] = val
 
-		if pair.Key == "id" {
+		if colName == pkCol {
 			switch v := val.(type) {
 			case int:
 				pk = uint64(v)
 			case float64:
 				pk = uint64(v)
+			}
+		}
+	}
+
+	if schema.AutoIncrement && pk == 0 {
+		pk = db.getNextAutoIncrement(schema.ID)
+		if pkIdx := schema.GetColumnIndex(pkCol); pkIdx != -1 {
+			rowData[pkIdx] = int(pk)
+		}
+	}
+
+	for i, col := range schema.Columns {
+		if rowData[i] == nil {
+			if schema.Constraints.NotNull[col] {
+				return "", fmt.Errorf("column '%s' cannot be null", col)
+			}
+		}
+	}
+
+	if schema.Constraints.Unique != nil {
+		for col, _ := range schema.Constraints.Unique {
+			colIdx := schema.GetColumnIndex(col)
+			if colIdx >= 0 && colIdx < len(rowData) && rowData[colIdx] != nil {
+				if err := db.validateUnique(schema, col, rowData[colIdx]); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+
+	if len(schema.ForeignKeys) > 0 {
+		for fkCol, fkRef := range schema.ForeignKeys {
+			colIdx := schema.GetColumnIndex(fkCol)
+			if colIdx == -1 || colIdx >= len(rowData) {
+				continue
+			}
+			fkVal := rowData[colIdx]
+			if fkVal == nil {
+				continue
+			}
+			if err := db.validateForeignKey(fkRef.Table, fkRef.Column, fkVal); err != nil {
+				return "", fmt.Errorf("foreign key constraint failed: %w", err)
 			}
 		}
 	}
@@ -626,35 +1035,6 @@ func (db *RelationalDB) handleInsert(cmd *InsertCmd) (string, error) {
 	return "Insert successful", nil
 }
 
-func (db *RelationalDB) handleSelect(cmd *SelectCmd) (string, error) {
-	rows, err := db.selectWithOptions(cmd.Table, cmd.Where, cmd.OrderBy, cmd.Limit, cmd.Offset)
-	if err != nil {
-		return "", err
-	}
-
-	if len(cmd.Columns) > 0 && cmd.Columns[0] != "*" {
-		db.mu.RLock()
-		schema := db.catalog[cmd.Table]
-		db.mu.RUnlock()
-
-		projected := make([]map[string]interface{}, len(rows))
-		for i, row := range rows {
-			obj := make(map[string]interface{}, len(cmd.Columns))
-			for _, col := range cmd.Columns {
-				if idx := schema.GetColumnIndex(col); idx >= 0 && idx < len(row.Data) {
-					obj[col] = row.Data[idx]
-				}
-			}
-			projected[i] = obj
-		}
-		out, _ := json.Marshal(projected)
-		return unsafeString(out), nil
-	}
-
-	out, _ := json.Marshal(rows)
-	return unsafeString(out), nil
-}
-
 func (db *RelationalDB) handleSelectCached(queryStr string, cmd *SelectCmd) (string, error) {
 	if cached, ok := db.resultCache.Get(queryStr); ok {
 		return cached, nil
@@ -667,6 +1047,108 @@ func (db *RelationalDB) handleSelectCached(queryStr string, cmd *SelectCmd) (str
 
 	db.resultCache.Set(queryStr, result)
 	return result, nil
+}
+
+func (db *RelationalDB) handleSelect(cmd *SelectCmd) (string, error) {
+	if cmd.Table == nil {
+		row := make(map[string]interface{})
+		for i, sel := range cmd.Selectors {
+			var name string
+			var val interface{}
+
+			if sel.Value != nil {
+				val = sel.Value.Value.ToInterface()
+				if sel.Value.Alias != "" {
+					name = sel.Value.Alias
+				} else if sel.Value.Value.Identifier != nil {
+					name = *sel.Value.Value.Identifier
+				} else {
+					name = fmt.Sprintf("col_%d", i)
+				}
+			} else if sel.Function != nil {
+				name = fmt.Sprintf("%s(%s)", sel.Function.Func.Name, sel.Function.Func.Arg)
+				if sel.Function.Alias != "" {
+					name = sel.Function.Alias
+				}
+				val = 0
+			} else if sel.Star {
+				return "[]", nil
+			} else {
+				continue
+			}
+
+			if name != "" {
+				row[name] = val
+			}
+		}
+		result := []map[string]interface{}{row}
+		out, _ := json.Marshal(result)
+		return unsafeString(out), nil
+	}
+
+	db.mu.RLock()
+	schema, exists := db.catalog[*cmd.Table]
+	db.mu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("table '%s' does not exist", *cmd.Table)
+	}
+
+	rows, err := db.selectWithOptions(*cmd.Table, cmd.Where, cmd.OrderBy, cmd.Limit, cmd.Offset)
+	if err != nil {
+		return "", err
+	}
+
+	var result []map[string]interface{}
+	for _, row := range rows {
+		outRow := make(map[string]interface{})
+		for i, sel := range cmd.Selectors {
+			name := fmt.Sprintf("col_%d", i)
+			var alias string
+			if sel.Star {
+				for j, colName := range schema.Columns {
+					if j < len(row.Data) {
+						outRow[colName] = row.Data[j]
+					}
+				}
+				continue
+			} else if sel.Value != nil {
+				if sel.Value.Alias != "" {
+					alias = sel.Value.Alias
+				} else if sel.Value.Value.Identifier != nil {
+					name = *sel.Value.Value.Identifier
+				}
+				colIdx := schema.GetColumnIndex(name)
+				if colIdx >= 0 && colIdx < len(row.Data) {
+					if alias != "" {
+						outRow[alias] = row.Data[colIdx]
+					} else {
+						outRow[name] = row.Data[colIdx]
+					}
+				}
+			} else if sel.Function != nil {
+				name = fmt.Sprintf("%s(%s)", sel.Function.Func.Name, sel.Function.Func.Arg)
+				if sel.Function.Alias != "" {
+					alias = sel.Function.Alias
+				}
+				colIdx := schema.GetColumnIndex(sel.Function.Func.Arg)
+				if colIdx >= 0 && colIdx < len(row.Data) {
+					val := row.Data[colIdx]
+					if alias != "" {
+						outRow[alias] = val
+					} else {
+						outRow[name] = val
+					}
+				}
+			}
+		}
+		if len(outRow) > 0 {
+			result = append(result, outRow)
+		}
+	}
+
+	out, _ := json.Marshal(result)
+	return unsafeString(out), nil
 }
 
 func (db *RelationalDB) handleFind(cmd *FindCmd) (string, error) {
@@ -720,7 +1202,8 @@ applySort:
 	if orderBy != nil {
 		colIdx := schema.GetColumnIndex(orderBy.Column)
 		if colIdx >= 0 {
-			sortRows(rows, colIdx, orderBy.Desc)
+			desc := strings.EqualFold(orderBy.Direction, "DESC")
+			sortRows(rows, colIdx, desc)
 		}
 	}
 
@@ -736,102 +1219,6 @@ applySort:
 	}
 
 	return rows, nil
-}
-
-func (db *RelationalDB) parallelScan(schema *TableSchema, where *WhereClause) []Row {
-	prefix := db.encoder.EncodeKey(schema.ID, 0)[:4]
-	iter, err := db.kv.NewPrefixIterator(prefix)
-	if err != nil {
-		return nil
-	}
-	defer iter.Close()
-
-	var pairs []struct {
-		key []byte
-		val []byte
-	}
-
-	for {
-		key, val, err := iter.Current()
-		if err != nil {
-			break
-		}
-		keyCopy := make([]byte, len(key))
-		copy(keyCopy, key)
-		valCopy := make([]byte, len(val))
-		copy(valCopy, val)
-		pairs = append(pairs, struct {
-			key []byte
-			val []byte
-		}{keyCopy, valCopy})
-
-		if err := iter.Next(); err != nil {
-			break
-		}
-	}
-
-	if len(pairs) < 100 {
-		rows := make([]Row, 0, len(pairs))
-		for _, p := range pairs {
-			decoded, err := db.encoder.DecodeValue(p.val)
-			if err == nil {
-				pk := binary.BigEndian.Uint64(p.key[4:12])
-				row := Row{PrimaryKey: pk, Data: decoded}
-				if where == nil || db.matchesFilter(schema, row, where) {
-					rows = append(rows, row)
-				}
-			}
-		}
-		return rows
-	}
-
-	numWorkers := runtime.NumCPU()
-	chunkSize := (len(pairs) + numWorkers - 1) / numWorkers
-
-	var wg sync.WaitGroup
-	results := make([][]Row, numWorkers)
-
-	for w := 0; w < numWorkers; w++ {
-		start := w * chunkSize
-		end := start + chunkSize
-		if end > len(pairs) {
-			end = len(pairs)
-		}
-		if start >= len(pairs) {
-			break
-		}
-
-		wg.Add(1)
-		go func(workerID, start, end int) {
-			defer wg.Done()
-			localRows := make([]Row, 0, end-start)
-			for i := start; i < end; i++ {
-				p := pairs[i]
-				decoded, err := db.encoder.DecodeValue(p.val)
-				if err == nil {
-					pk := binary.BigEndian.Uint64(p.key[4:12])
-					row := Row{PrimaryKey: pk, Data: decoded}
-					if where == nil || db.matchesFilter(schema, row, where) {
-						localRows = append(localRows, row)
-					}
-				}
-			}
-			results[workerID] = localRows
-		}(w, start, end)
-	}
-
-	wg.Wait()
-
-	totalLen := 0
-	for _, r := range results {
-		totalLen += len(r)
-	}
-	rows := make([]Row, 0, totalLen)
-	for _, r := range results {
-		rows = append(rows, r...)
-	}
-
-	return rows
 }
 
 func sortRows(rows []Row, colIdx int, desc bool) {
@@ -870,7 +1257,7 @@ func (db *RelationalDB) tryIndexLookup(idx *IndexSchema, where *WhereClause) []u
 				if idx.bloom != nil {
 					valBytes := valueToBytes(val)
 					if valBytes != nil && !idx.bloom.Test(valBytes) {
-						return []uint64{} 
+						return []uint64{}
 					}
 				}
 
@@ -1014,26 +1401,27 @@ func (db *RelationalDB) handleUpdate(cmd *UpdateCmd) (string, error) {
 		return "", fmt.Errorf("table '%s' does not exist", cmd.Table)
 	}
 
-	rows, keys, err := db.selectRowsWithKeys(schema, cmd.Where)
+	rows, err := db.FastQuery(schema, cmd.Where, nil, nil, nil)
 	if err != nil {
 		return "", err
 	}
 
 	var kvPairs [][2][]byte
-	for i, row := range rows {
-		for _, kv := range cmd.Set {
-			colIdx := schema.GetColumnIndex(kv.Key)
+	for _, row := range rows {
+		for _, assign := range cmd.Assignments {
+			colIdx := schema.GetColumnIndex(assign.Column)
 			if colIdx == -1 {
-				return "", fmt.Errorf("unknown column: %s", kv.Key)
+				return "", fmt.Errorf("unknown column: %s", assign.Column)
 			}
-			row.Data[colIdx] = kv.Value.ToInterface()
+			row.Data[colIdx] = assign.Value.ToInterface()
 		}
 
 		valBytes, err := db.encoder.EncodeValue(row)
 		if err != nil {
 			return "", err
 		}
-		kvPairs = append(kvPairs, [2][]byte{keys[i], valBytes})
+		key := db.encoder.EncodeKey(schema.ID, row.PrimaryKey)
+		kvPairs = append(kvPairs, [2][]byte{key, valBytes})
 	}
 
 	if len(kvPairs) > 0 {
@@ -1053,9 +1441,15 @@ func (db *RelationalDB) handleDelete(cmd *DeleteCmd) (string, error) {
 		return "", fmt.Errorf("table '%s' does not exist", cmd.Table)
 	}
 
-	_, keys, err := db.selectRowsWithKeys(schema, cmd.Where)
+	rows, err := db.FastQuery(schema, cmd.Where, nil, nil, nil)
 	if err != nil {
 		return "", err
+	}
+
+	var keys [][]byte
+	for _, row := range rows {
+		key := db.encoder.EncodeKey(schema.ID, row.PrimaryKey)
+		keys = append(keys, key)
 	}
 
 	if len(keys) > 0 {
@@ -1108,7 +1502,7 @@ func (db *RelationalDB) handleDrop(cmd *DropCmd) (string, error) {
 	return fmt.Sprintf("Table '%s' dropped", cmd.Table), nil
 }
 
-func (db *RelationalDB) createTableInternal(name string, colNames []string) error {
+func (db *RelationalDB) createTableFull(name string, colNames []string, colTypes []string, primaryKey string, autoIncrement bool, foreignKeys map[string]FKRef, constraints ColumnConstraints) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -1116,11 +1510,67 @@ func (db *RelationalDB) createTableInternal(name string, colNames []string) erro
 		return fmt.Errorf("table '%s' already exists", name)
 	}
 
+	if colTypes == nil {
+		colTypes = make([]string, len(colNames))
+		for i := range colTypes {
+			colTypes[i] = "any"
+		}
+	}
+
+	if primaryKey != "" {
+		found := false
+		for _, col := range colNames {
+			if col == primaryKey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("primary key column '%s' not found in table", primaryKey)
+		}
+	}
+
+	for fkCol, fkRef := range foreignKeys {
+		refSchema, exists := db.catalog[fkRef.Table]
+		if !exists {
+			return fmt.Errorf("foreign key references non-existent table '%s'", fkRef.Table)
+		}
+		if refSchema.GetColumnIndex(fkRef.Column) == -1 {
+			return fmt.Errorf("foreign key references non-existent column '%s' in table '%s'", fkRef.Column, fkRef.Table)
+		}
+		found := false
+		for _, col := range colNames {
+			if col == fkCol {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("foreign key column '%s' not found in table", fkCol)
+		}
+	}
+
 	id := db.nextTableID
 	db.nextTableID++
 
-	schema := &TableSchema{ID: id, Name: name, Columns: colNames}
-	schema.GetColumnIndex("") 
+	schema := &TableSchema{
+		ID:            id,
+		Name:          name,
+		Columns:       colNames,
+		Types:         colTypes,
+		PrimaryKey:    primaryKey,
+		AutoIncrement: autoIncrement,
+		ForeignKeys:   foreignKeys,
+		Constraints:   constraints,
+	}
+	schema.InitColumnIndex()
+
+	if autoIncrement {
+		key := db.encoder.EncodeKey(SystemCatalogID+1, uint64(id))
+		seqVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(seqVal, 0)
+		db.kv.Set(key, seqVal)
+	}
 
 	key := db.encoder.EncodeKey(SystemCatalogID, uint64(id))
 	val, _ := json.Marshal(schema)
@@ -1131,41 +1581,300 @@ func (db *RelationalDB) createTableInternal(name string, colNames []string) erro
 	return nil
 }
 
-func (db *RelationalDB) selectRowsWithKeys(schema *TableSchema, where *WhereClause) ([]Row, [][]byte, error) {
+func (db *RelationalDB) validateForeignKey(refTable, refColumn string, value interface{}) error {
+	db.mu.RLock()
+	schema, exists := db.catalog[refTable]
+	db.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("referenced table '%s' does not exist", refTable)
+	}
+
+	colIdx := schema.GetColumnIndex(refColumn)
+	if colIdx == -1 {
+		return fmt.Errorf("referenced column '%s' does not exist in table '%s'", refColumn, refTable)
+	}
+
 	prefix := db.encoder.EncodeKey(schema.ID, 0)[:4]
 	iter, err := db.kv.NewPrefixIterator(prefix)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 	defer iter.Close()
 
-	rows := make([]Row, 0, 64)
-	keys := make([][]byte, 0, 64)
-
 	for {
-		key, val, err := iter.Current()
+		_, val, err := iter.Current()
 		if err != nil {
 			break
 		}
 
-		decoded, err := db.encoder.DecodeValue(val)
-		if err == nil {
-			pk := binary.BigEndian.Uint64(key[4:12])
-			row := Row{PrimaryKey: pk, Data: decoded}
-
-			if where == nil || db.matchesFilter(schema, row, where) {
-				rows = append(rows, row)
-				keyCopy := make([]byte, len(key))
-				copy(keyCopy, key)
-				keys = append(keys, keyCopy)
+		rowData, err := db.encoder.DecodeValue(val)
+		if err != nil {
+			iter.Next()
+			continue
+		}
+		if colIdx < len(rowData) {
+			if compareValues(rowData[colIdx], value) {
+				return nil
 			}
 		}
+		iter.Next()
+	}
 
-		if err := iter.Next(); err != nil {
-			break
+	return fmt.Errorf("no matching row in '%s' where %s = %v", refTable, refColumn, value)
+}
+
+func compareValues(a, b interface{}) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	switch av := a.(type) {
+	case int:
+		switch bv := b.(type) {
+		case int:
+			return av == bv
+		case float64:
+			return float64(av) == bv
+		}
+	case float64:
+		switch bv := b.(type) {
+		case int:
+			return av == float64(bv)
+		case float64:
+			return av == bv
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			return av == bv
+		}
+	case bool:
+		if bv, ok := b.(bool); ok {
+			return av == bv
 		}
 	}
-	return rows, keys, nil
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
+func (db *RelationalDB) getNextAutoIncrement(tableID uint32) uint64 {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	key := db.encoder.EncodeKey(SystemCatalogID+1, uint64(tableID))
+	val, err := db.kv.Get(key)
+	if err != nil || len(val) < 8 {
+		seqVal := make([]byte, 8)
+		binary.BigEndian.PutUint64(seqVal, 1)
+		db.kv.Set(key, seqVal)
+		return 1
+	}
+
+	seq := binary.BigEndian.Uint64(val)
+	seq++
+	seqVal := make([]byte, 8)
+	binary.BigEndian.PutUint64(seqVal, seq)
+	db.kv.Set(key, seqVal)
+	return seq
+}
+
+func (db *RelationalDB) validateColumnValue(schema *TableSchema, colName string, value interface{}) error {
+	if value == nil {
+		if schema.Constraints.NotNull[colName] {
+			return fmt.Errorf("column '%s' cannot be null", colName)
+		}
+		return nil
+	}
+
+	if enumValues, ok := schema.Constraints.Enums[colName]; ok {
+		strVal := fmt.Sprintf("%v", value)
+		found := false
+		for _, ev := range enumValues {
+			if ev == strVal {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("column '%s' value '%v' not in enum: %v", colName, value, enumValues)
+		}
+	}
+
+	if maxLen, ok := schema.Constraints.Lengths[colName]; ok {
+		if strVal, ok := value.(string); ok {
+			if len(strVal) > maxLen {
+				return fmt.Errorf("column '%s' value exceeds maximum length of %d", colName, maxLen)
+			}
+		}
+	}
+
+	if checkExpr, ok := schema.Constraints.Checks[colName]; ok {
+		if err := db.validateCheckConstraint(colName, value, checkExpr); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (db *RelationalDB) validateCheckConstraint(colName string, value interface{}, checkExpr string) error {
+
+	if strings.Contains(checkExpr, " IN (") {
+		parts := strings.SplitN(checkExpr, " IN (", 2)
+		if len(parts) == 2 {
+			listStr := strings.TrimSuffix(parts[1], ")")
+
+			var allowed []string
+			var current strings.Builder
+			inQuote := false
+			for _, r := range listStr {
+				if r == '\'' {
+					inQuote = !inQuote
+				}
+				if r == ',' && !inQuote {
+					allowed = append(allowed, strings.TrimSpace(current.String()))
+					current.Reset()
+				} else {
+					current.WriteRune(r)
+				}
+			}
+			if current.Len() > 0 {
+				allowed = append(allowed, strings.TrimSpace(current.String()))
+			}
+
+			strVal := fmt.Sprintf("%v", value)
+
+			found := false
+			for _, item := range allowed {
+				cleanItem := strings.Trim(item, "'")
+				if cleanItem == strVal {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("check constraint failed: value '%v' not allowed", value)
+			}
+			return nil
+		}
+	}
+
+	checkExpr = strings.Trim(checkExpr, `"'`)
+
+	if strings.Contains(checkExpr, "LIKE") {
+		pattern := extractLikePattern(checkExpr)
+		if pattern != "" {
+			strVal := fmt.Sprintf("%v", value)
+			if !matchesLike(strVal, pattern) {
+				return fmt.Errorf("check constraint failed: %s does not match pattern %s", colName, pattern)
+			}
+		}
+		return nil
+	}
+
+	parts := strings.Fields(checkExpr)
+	if len(parts) >= 3 {
+		op := parts[1]
+		valStr := parts[2]
+
+		valNum, err := strconv.ParseFloat(valStr, 64)
+		if err == nil {
+			rowNum, isNum := toFloat64(value)
+			if isNum {
+				switch op {
+				case ">":
+					if !(rowNum > valNum) {
+						return fmt.Errorf("check constraint failed: %v must be > %v", value, valNum)
+					}
+				case ">=":
+					if !(rowNum >= valNum) {
+						return fmt.Errorf("check constraint failed: %v must be >= %v", value, valNum)
+					}
+				case "<":
+					if !(rowNum < valNum) {
+						return fmt.Errorf("check constraint failed: %v must be < %v", value, valNum)
+					}
+				case "<=":
+					if !(rowNum <= valNum) {
+						return fmt.Errorf("check constraint failed: %v must be <= %v", value, valNum)
+					}
+				case "=":
+					if !(rowNum == valNum) {
+						return fmt.Errorf("check constraint failed: %v must be == %v", value, valNum)
+					}
+				case "!=":
+					if !(rowNum != valNum) {
+						return fmt.Errorf("check constraint failed: %v must be != %v", value, valNum)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func extractLikePattern(expr string) string {
+	parts := strings.Split(expr, "LIKE")
+	if len(parts) < 2 {
+		return ""
+	}
+	pattern := strings.TrimSpace(parts[1])
+	pattern = strings.Trim(pattern, `"'`)
+	return pattern
+}
+
+func matchesLike(str, pattern string) bool {
+	if pattern == "" {
+		return true
+	}
+
+	regexPattern := "^"
+	for i := 0; i < len(pattern); i++ {
+		if pattern[i] == '%' {
+			regexPattern += ".*"
+		} else if pattern[i] == '_' {
+			regexPattern += "."
+		} else {
+			regexPattern += regexp.QuoteMeta(string(pattern[i]))
+		}
+	}
+	regexPattern += "$"
+
+	matched, _ := regexp.MatchString(regexPattern, str)
+	return matched
+}
+
+func (db *RelationalDB) validateUnique(schema *TableSchema, colName string, value interface{}) error {
+	colIdx := schema.GetColumnIndex(colName)
+	if colIdx == -1 {
+		return nil
+	}
+
+	prefix := db.encoder.EncodeKey(schema.ID, 0)[:4]
+	iter, err := db.kv.NewPrefixIterator(prefix)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+
+	for {
+		_, val, err := iter.Current()
+		if err != nil {
+			break
+		}
+
+		rowData, err := db.encoder.DecodeValue(val)
+		if err != nil {
+			iter.Next()
+			continue
+		}
+
+		if colIdx < len(rowData) && compareValues(rowData[colIdx], value) {
+			return fmt.Errorf("unique constraint violation: column '%s' value '%v' already exists", colName, value)
+		}
+		iter.Next()
+	}
+
+	return nil
 }
 
 func (db *RelationalDB) matchesFilter(schema *TableSchema, row Row, where *WhereClause) bool {
@@ -1338,6 +2047,7 @@ func (db *RelationalDB) loadCatalog() error {
 		}
 		var schema TableSchema
 		if json.Unmarshal(val, &schema) == nil {
+			schema.InitColumnIndex()
 			db.catalog[schema.Name] = &schema
 			if schema.ID >= db.nextTableID {
 				atomic.StoreUint32(&db.nextTableID, schema.ID+1)
@@ -1386,11 +2096,11 @@ func unsafeString(b []byte) string {
 func (db *RelationalDB) Stats() map[string]interface{} {
 	resultHits, resultMisses := db.resultCache.Stats()
 	return map[string]interface{}{
-		"queries":            atomic.LoadUint64(&db.queryCount),
-		"query_cache_hits":   atomic.LoadUint64(&db.cacheHits),
-		"result_cache_hits":  resultHits,
+		"queries":             atomic.LoadUint64(&db.queryCount),
+		"query_cache_hits":    atomic.LoadUint64(&db.cacheHits),
+		"result_cache_hits":   resultHits,
 		"result_cache_misses": resultMisses,
-		"tables":             len(db.catalog),
-		"indexes":            len(db.indexes),
+		"tables":              len(db.catalog),
+		"indexes":             len(db.indexes),
 	}
 }
