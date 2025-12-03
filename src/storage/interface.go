@@ -1,6 +1,6 @@
 package storage
 
-import "github.com/couchbase/moss"
+import "github.com/r-ef/moss"
 
 type KVStore interface {
 	Set(key, value []byte) error

@@ -16,6 +16,8 @@ import (
 	"github.com/r-ef/fasty/src/cmd/engine"
 )
 
+// go get github.com/r-ef/moss@commitHash && go mod tidy
+
 var inMemoryMode = flag.Bool("memory", false, "Run in ultra-fast in-memory mode (no persistence)")
 var durableMode = flag.Bool("durable", false, "Enable WAL for immediate durability (slower but crash-safe)")
 

@@ -5,9 +5,9 @@ go 1.25.4
 require (
 	github.com/alecthomas/participle/v2 v2.1.4
 	github.com/bits-and-blooms/bloom/v3 v3.7.1
-	github.com/couchbase/moss v0.3.0
 	github.com/goccy/go-json v0.10.5
 	github.com/klauspost/compress v1.18.2
+	github.com/r-ef/moss v0.0.0-20251203020209-c75b65c97aa1
 	github.com/valyala/fasthttp v1.68.0
 )
 
@@ -20,5 +20,3 @@ require (
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	golang.org/x/sys v0.37.0 // indirect
 )
-
-replace github.com/couchbase/moss => github.com/r-ef/moss v0.0.0-20251202234607-dea8c8989bd8

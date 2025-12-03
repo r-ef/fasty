@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"runtime"
 	"sort"
 	"strconv"
@@ -578,12 +579,14 @@ func (db *RelationalDB) handleDescribe(tableName string) (string, error) {
 }
 
 func (db *RelationalDB) handleCreate(cmd *CreateCmd) (string, error) {
+	log.Printf("Create: table %s, elements %d", cmd.Name, len(cmd.Elements))
 	var cols []ColDef
 	for _, el := range cmd.Elements {
 		if el.Column != nil {
 			cols = append(cols, *el.Column)
 		}
 	}
+	log.Printf("Create: found %d columns", len(cols))
 
 	colNames := make([]string, len(cols))
 	colTypes := make([]string, len(cols))
@@ -916,12 +919,14 @@ func (db *RelationalDB) handleDropIndex(cmd *DropIndexCmd) (string, error) {
 }
 
 func (db *RelationalDB) handleInsert(cmd *InsertCmd) (string, error) {
+	log.Printf("Insert: table=%s, columns=%v, values count=%d", cmd.Table, cmd.Columns, len(cmd.Values))
 	db.mu.RLock()
 	schema, exists := db.catalog[cmd.Table]
 	tableIndexes := db.tableIndex[cmd.Table]
 	db.mu.RUnlock()
 
 	if !exists {
+		log.Printf("Insert: table '%s' does not exist", cmd.Table)
 		return "", fmt.Errorf("table '%s' does not exist", cmd.Table)
 	}
 
@@ -977,6 +982,7 @@ func (db *RelationalDB) handleInsert(cmd *InsertCmd) (string, error) {
 			rowData[pkIdx] = int(pk)
 		}
 	}
+	log.Printf("Insert: final rowData %v", rowData)
 
 	for i, col := range schema.Columns {
 		if rowData[i] == nil {
@@ -1044,6 +1050,7 @@ func (db *RelationalDB) handleInsert(cmd *InsertCmd) (string, error) {
 	if err := db.kv.BatchSet(kvPairs); err != nil {
 		return "", err
 	}
+	log.Printf("Insert: stored %d kv pairs", len(kvPairs))
 
 	return "Insert successful", nil
 }
@@ -1063,6 +1070,7 @@ func (db *RelationalDB) handleSelectCached(queryStr string, cmd *SelectCmd) (str
 }
 
 func (db *RelationalDB) handleSelect(cmd *SelectCmd) (string, error) {
+	log.Printf("Select: table=%v", cmd.Table)
 	if cmd.Table == nil {
 		row := make(map[string]interface{})
 		for i, sel := range cmd.Selectors {
@@ -1111,6 +1119,7 @@ func (db *RelationalDB) handleSelect(cmd *SelectCmd) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	log.Printf("Select: got %d rows from table %s", len(rows), *cmd.Table)
 
 	var result []map[string]interface{}
 	for _, row := range rows {
@@ -1159,8 +1168,13 @@ func (db *RelationalDB) handleSelect(cmd *SelectCmd) (string, error) {
 			result = append(result, outRow)
 		}
 	}
-
-	out, _ := json.Marshal(result)
+	log.Printf("Select: result length %d", len(result))
+	out, err := json.Marshal(result)
+	if err != nil {
+		log.Printf("Select: marshal error %v", err)
+		return "", err
+	}
+	log.Printf("Select: marshaled to %s", string(out))
 	return unsafeString(out), nil
 }
 
@@ -1565,6 +1579,7 @@ func (db *RelationalDB) handleDrop(cmd *DropCmd) (string, error) {
 }
 
 func (db *RelationalDB) createTableFull(name string, colNames []string, colTypes []string, primaryKey string, autoIncrement bool, foreignKeys map[string]FKRef, constraints ColumnConstraints) error {
+	log.Printf("createTableFull: table %s, columns %v", name, colNames)
 	db.mu.Lock()
 	defer db.mu.Unlock()
 

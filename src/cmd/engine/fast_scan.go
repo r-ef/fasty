@@ -3,7 +3,7 @@ package engine
 import (
 	"container/heap"
 	"encoding/binary"
-	"sort"
+	"log"
 	"strings"
 	"unsafe"
 )
@@ -54,8 +54,10 @@ func (db *RelationalDB) FastQuery(schema *TableSchema, where *WhereClause, order
 	}
 
 	prefix := db.encoder.EncodeKey(schema.ID, 0)[:4]
+	log.Printf("FastQuery: prefix %x for table %s id %d", prefix, schema.Name, schema.ID)
 	iter, err := db.kv.NewPrefixIterator(prefix)
 	if err != nil {
+		log.Printf("FastQuery: iterator error %v", err)
 		return nil, err
 	}
 	defer iter.Close()
@@ -72,14 +74,18 @@ func (db *RelationalDB) FastQuery(schema *TableSchema, where *WhereClause, order
 	for {
 		key, val, err := iter.Current()
 		if err != nil {
+			log.Printf("FastQuery: iter error %v", err)
 			break
 		}
+		log.Printf("FastQuery: processing key")
 
 		decoded, err := db.encoder.DecodeValue(val)
 		if err != nil {
+			log.Printf("FastQuery: decode error %v", err)
 			iter.Next()
 			continue
 		}
+		log.Printf("FastQuery: decoded %v", decoded)
 
 		if where != nil && !db.matchesFilterFast(schema, decoded, where, matchers) {
 			iter.Next()
@@ -98,7 +104,7 @@ func (db *RelationalDB) FastQuery(schema *TableSchema, where *WhereClause, order
 			break
 		}
 	}
-
+	log.Printf("FastQuery: returning %d results for table %s", len(results), schema.Name)
 	return results, nil
 }
 
@@ -394,6 +400,25 @@ type IndexItem struct {
 	key []byte
 }
 
+type IndexHeap []IndexItem
+
+func (h IndexHeap) Len() int { return len(h) }
+func (h IndexHeap) Less(i, j int) bool {
+	vi := decodeValueFromKey(h[i].key)
+	vj := decodeValueFromKey(h[j].key)
+	cmp := compareInterface(vi, vj)
+	return cmp > 0 // for DESC: larger first
+}
+func (h IndexHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *IndexHeap) Push(x interface{}) { *h = append(*h, x.(IndexItem)) }
+func (h *IndexHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 func decodeValueFromKey(key []byte) interface{} {
 	if len(key) < 5 {
 		return nil
@@ -436,66 +461,108 @@ func (db *RelationalDB) fastQueryWithIndex(idx *IndexSchema, schema *TableSchema
 	}
 
 	var items []IndexItem
-	for {
-		key, val, err := iter.Current()
-		if err != nil {
-			break
-		}
-
-		if len(val) != 8 {
-			iter.Next()
-			continue
-		}
-		pk := binary.BigEndian.Uint64(val)
-
-		if where != nil {
-			// Fetch the full row to apply WHERE
-			rowKey := db.encoder.EncodeKey(schema.ID, pk)
-			rowVal, err := db.kv.Get(rowKey)
-			if err != nil || rowVal == nil {
-				iter.Next()
-				continue
-			}
-
-			decoded, err := db.encoder.DecodeValue(rowVal)
-			if err != nil {
-				iter.Next()
-				continue
-			}
-
-			// Apply WHERE filter
-			if !db.matchesFilterFast(schema, decoded, where, matchers) {
-				iter.Next()
-				continue
-			}
-		}
-
-		keyCopy := make([]byte, len(key))
-		copy(keyCopy, key)
-		items = append(items, IndexItem{pk: pk, key: keyCopy})
-
-		if !desc && len(items) >= need {
-			break
-		}
-
-		if err := iter.Next(); err != nil {
-			break
-		}
-	}
-
 	if desc {
-		// Sort items by value DESC
-		sort.Slice(items, func(i, j int) bool {
-			vi := decodeValueFromKey(items[i].key)
-			vj := decodeValueFromKey(items[j].key)
-			cmp := compareInterface(vi, vj)
-			return cmp > 0 // DESC: larger first
-		})
-	}
+		// For DESC, use heap to keep top K
+		h := &IndexHeap{}
+		heap.Init(h)
 
-	// Take only needed
-	if len(items) > need {
-		items = items[:need]
+		for {
+			key, val, err := iter.Current()
+			if err != nil {
+				break
+			}
+
+			if len(val) != 8 {
+				iter.Next()
+				continue
+			}
+			pk := binary.BigEndian.Uint64(val)
+
+			if where != nil {
+				// Fetch the full row to apply WHERE
+				rowKey := db.encoder.EncodeKey(schema.ID, pk)
+				rowVal, err := db.kv.Get(rowKey)
+				if err != nil || rowVal == nil {
+					iter.Next()
+					continue
+				}
+
+				decoded, err := db.encoder.DecodeValue(rowVal)
+				if err != nil {
+					iter.Next()
+					continue
+				}
+
+				// Apply WHERE filter
+				if !db.matchesFilterFast(schema, decoded, where, matchers) {
+					iter.Next()
+					continue
+				}
+			}
+
+			keyCopy := make([]byte, len(key))
+			copy(keyCopy, key)
+			item := IndexItem{pk: pk, key: keyCopy}
+			heap.Push(h, item)
+
+			if h.Len() > need {
+				heap.Pop(h)
+			}
+
+			if err := iter.Next(); err != nil {
+				break
+			}
+		}
+
+		items = *h
+	} else {
+		// For ASC, collect first need
+		for {
+			if len(items) >= need {
+				break
+			}
+
+			key, val, err := iter.Current()
+			if err != nil {
+				break
+			}
+
+			if len(val) != 8 {
+				iter.Next()
+				continue
+			}
+			pk := binary.BigEndian.Uint64(val)
+
+			if where != nil {
+				// Fetch the full row to apply WHERE
+				rowKey := db.encoder.EncodeKey(schema.ID, pk)
+				rowVal, err := db.kv.Get(rowKey)
+				if err != nil || rowVal == nil {
+					iter.Next()
+					continue
+				}
+
+				decoded, err := db.encoder.DecodeValue(rowVal)
+				if err != nil {
+					iter.Next()
+					continue
+				}
+
+				// Apply WHERE filter
+				if !db.matchesFilterFast(schema, decoded, where, matchers) {
+					iter.Next()
+					continue
+				}
+			}
+
+			keyCopy := make([]byte, len(key))
+			copy(keyCopy, key)
+			items = append(items, IndexItem{pk: pk, key: keyCopy})
+
+			if err := iter.Next(); err != nil {
+				break
+			}
+		}
 	}
 
 	// Apply offset
@@ -516,8 +583,10 @@ func (db *RelationalDB) fastQueryWithIndex(idx *IndexSchema, schema *TableSchema
 		}
 		decoded, err := db.encoder.DecodeValue(rowVal)
 		if err != nil {
+			log.Printf("fastQueryWithIndex: decode error %v", err)
 			continue
 		}
+		log.Printf("fastQueryWithIndex: decoded %v", decoded)
 		row := Row{PrimaryKey: item.pk, Data: decoded}
 		rows = append(rows, row)
 	}

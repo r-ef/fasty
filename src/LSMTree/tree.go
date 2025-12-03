@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
-	"github.com/couchbase/moss"
+	"github.com/r-ef/moss"
 )
 
 type DB struct {
